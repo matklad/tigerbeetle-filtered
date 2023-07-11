@@ -19,7 +19,7 @@ pub const Config = struct {
 /// * key_value_from(values[i-1]) < key or i == 0
 ///
 /// Doesn't perform the extra key comparison to determine if the match is exact.
-pub fn binary_search_values_raw(
+pub fn binary_search_values_upsert_index(
     comptime Key: type,
     comptime Value: type,
     comptime key_from_value: fn (*const Value) callconv(.Inline) Key,
@@ -79,14 +79,14 @@ pub fn binary_search_values_raw(
     return @intCast(u32, offset);
 }
 
-pub inline fn binary_search_keys_raw(
+pub inline fn binary_search_keys_upsert_index(
     comptime Key: type,
     comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
     keys: []const Key,
     key: Key,
     comptime config: Config,
 ) u32 {
-    return binary_search_values_raw(
+    return binary_search_values_upsert_index(
         Key,
         Key,
         struct {
@@ -115,7 +115,7 @@ pub inline fn binary_search_values(
     key: Key,
     comptime config: Config,
 ) BinarySearchResult {
-    const index = binary_search_values_raw(Key, Value, key_from_value, compare_keys, values, key, config);
+    const index = binary_search_values_upsert_index(Key, Value, key_from_value, compare_keys, values, key, config);
     return .{
         .index = index,
         .exact = index < values.len and compare_keys(key_from_value(&values[index]), key) == .eq,
@@ -129,10 +129,145 @@ pub inline fn binary_search_keys(
     key: Key,
     comptime config: Config,
 ) BinarySearchResult {
-    const index = binary_search_keys_raw(Key, compare_keys, keys, key, config);
+    const index = binary_search_keys_upsert_index(Key, compare_keys, keys, key, config);
     return .{
         .index = index,
         .exact = index < keys.len and compare_keys(keys[index], key) == .eq,
+    };
+}
+
+pub const BinarySearchRangeUpsertIndexes = struct {
+    start: u32,
+    end: u32,
+};
+
+pub inline fn binary_search_keys_range_upsert_indexes(
+    comptime Key: type,
+    comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
+    keys: []const Key,
+    key_min: Key,
+    key_max: Key,
+    comptime config: Config,
+) BinarySearchRangeUpsertIndexes {
+    return binary_search_values_range_upsert_indexes(
+        Key,
+        Key,
+        struct {
+            inline fn key_from_key(k: *const Key) Key {
+                return k.*;
+            }
+        }.key_from_key,
+        compare_keys,
+        keys,
+        key_min,
+        key_max,
+        config,
+    );
+}
+
+pub inline fn binary_search_values_range_upsert_indexes(
+    comptime Key: type,
+    comptime Value: type,
+    comptime key_from_value: fn (*const Value) callconv(.Inline) Key,
+    comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
+    values: []const Value,
+    key_min: Key,
+    key_max: Key,
+    comptime config: Config,
+) BinarySearchRangeUpsertIndexes {
+    const start = binary_search_values_upsert_index(
+        Key,
+        Value,
+        key_from_value,
+        compare_keys,
+        values,
+        key_min,
+        config,
+    );
+
+    if (start == values.len) return .{
+        .start = start,
+        .end = start,
+    };
+
+    const end = binary_search_values_upsert_index(
+        Key,
+        Value,
+        key_from_value,
+        compare_keys,
+        values[start..],
+        key_max,
+        config,
+    );
+
+    return .{
+        .start = start,
+        .end = start + end,
+    };
+}
+
+pub const BinarySearchRange = struct {
+    start: u32,
+    count: u32,
+};
+
+pub inline fn binary_search_keys_range(
+    comptime Key: type,
+    comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
+    keys: []const Key,
+    key_min: Key,
+    key_max: Key,
+    comptime config: Config,
+) BinarySearchRange {
+    return binary_search_values_range(
+        Key,
+        Key,
+        struct {
+            inline fn key_from_key(k: *const Key) Key {
+                return k.*;
+            }
+        }.key_from_key,
+        compare_keys,
+        keys,
+        key_min,
+        key_max,
+        config,
+    );
+}
+
+pub inline fn binary_search_values_range(
+    comptime Key: type,
+    comptime Value: type,
+    comptime key_from_value: fn (*const Value) callconv(.Inline) Key,
+    comptime compare_keys: fn (Key, Key) callconv(.Inline) math.Order,
+    values: []const Value,
+    key_min: Key,
+    key_max: Key,
+    comptime config: Config,
+) BinarySearchRange {
+    const upsert_indexes = binary_search_values_range_upsert_indexes(
+        Key,
+        Value,
+        key_from_value,
+        compare_keys,
+        values,
+        key_min,
+        key_max,
+        config,
+    );
+
+    if (upsert_indexes.start == values.len) return .{
+        .start = upsert_indexes.start -| 1,
+        .count = 0,
+    };
+
+    const inclusive = @boolToInt(
+        upsert_indexes.end < values.len and
+            compare_keys(key_max, key_from_value(&values[upsert_indexes.end])) == .eq,
+    );
+    return .{
+        .start = upsert_indexes.start,
+        .count = upsert_indexes.end - upsert_indexes.start + inclusive,
     };
 }
 
@@ -256,6 +391,59 @@ const test_binary_search = struct {
         try std.testing.expectEqual(expect.index, actual.index);
         try std.testing.expectEqual(expect.exact, actual.exact);
     }
+
+    pub fn range_search(
+        keys: []const u32,
+        key_min: u32,
+        key_max: u32,
+    ) BinarySearchRange {
+        return binary_search_keys_range(
+            u32,
+            compare_keys,
+            keys,
+            key_min,
+            key_max,
+            .{ .verify = true },
+        );
+    }
+
+    fn random_range_search(random: std.rand.Random, iter: usize) !void {
+        const keys_count = @minimum(
+            @as(usize, 1E6),
+            fuzz.random_int_exponential(random, usize, iter),
+        );
+
+        const keys = try std.testing.allocator.alloc(u32, keys_count);
+        defer std.testing.allocator.free(keys);
+
+        for (keys) |*key| key.* = fuzz.random_int_exponential(random, u32, 100);
+        std.sort.sort(u32, keys, {}, less_than_key);
+        const target_key = fuzz.random_int_exponential(random, u32, 100);
+
+        var expect: BinarySearchResult = .{ .index = 0, .exact = false };
+        for (keys) |key, i| {
+            switch (compare_keys(key, target_key)) {
+                .lt => expect.index = @intCast(u32, i) + 1,
+                .eq => {
+                    expect.exact = true;
+                    break;
+                },
+                .gt => break,
+            }
+        }
+
+        const actual = binary_search_keys(
+            u32,
+            compare_keys,
+            keys,
+            target_key,
+            .{ .verify = true },
+        );
+
+        if (log) std.debug.print("expected: {}, actual: {}\n", .{ expect, actual });
+        try std.testing.expectEqual(expect.index, actual.index);
+        try std.testing.expectEqual(expect.exact, actual.exact);
+    }
 };
 
 // TODO test search on empty slice
@@ -337,5 +525,102 @@ test "binary search: random" {
     var i: usize = 0;
     while (i < 2048) : (i += 1) {
         try test_binary_search.random_search(rng.random(), i);
+    }
+}
+
+test "binary search: range" {
+    if (test_binary_search.log) std.debug.print("\n", .{});
+
+    const sequence = &[_]u32{ 3, 4, 10, 15, 20, 25, 30, 100, 1000 };
+
+    {
+        const range = test_binary_search.range_search(
+            sequence,
+            sequence[0],
+            sequence[sequence.len - 1],
+        );
+        try std.testing.expect(range.count == sequence.len);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, sequence, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 2, 5);
+        try std.testing.expect(range.count == 2);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, &[_]u32{ 3, 4 }, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 5, 10);
+        try std.testing.expect(range.count == 1);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, &[_]u32{10}, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 5, 14);
+        try std.testing.expect(range.count == 1);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, &[_]u32{10}, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 10, 10);
+        try std.testing.expect(range.count == 1);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, &[_]u32{10}, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 15, 100);
+        try std.testing.expect(range.count == 5);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+        try std.testing.expectEqualSlices(u32, &[_]u32{ 15, 20, 25, 30, 100 }, slice);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 1, 2);
+        try std.testing.expect(range.count == 0);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 101, 999);
+        try std.testing.expect(range.count == 0);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+    }
+
+    {
+        const range = test_binary_search.range_search(sequence, 1_001, 10_000);
+        try std.testing.expect(range.count == 0);
+
+        const slice = sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
+    }
+
+    {
+        const empty_sequence = &[_]u32{};
+        const range = test_binary_search.range_search(empty_sequence, 1, 2);
+        try std.testing.expect(range.count == 0);
+
+        const slice = empty_sequence[range.start..][0..range.count];
+        try std.testing.expect(slice.len == range.count);
     }
 }
