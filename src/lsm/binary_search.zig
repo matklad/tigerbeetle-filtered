@@ -418,31 +418,66 @@ const test_binary_search = struct {
 
         for (keys) |*key| key.* = fuzz.random_int_exponential(random, u32, 100);
         std.sort.sort(u32, keys, {}, less_than_key);
-        const target_key = fuzz.random_int_exponential(random, u32, 100);
 
-        var expect: BinarySearchResult = .{ .index = 0, .exact = false };
-        for (keys) |key, i| {
-            switch (compare_keys(key, target_key)) {
-                .lt => expect.index = @intCast(u32, i) + 1,
-                .eq => {
-                    expect.exact = true;
-                    break;
-                },
-                .gt => break,
+        const target_range = blk: {
+            // Cover many combinations of key_min, key_max:
+            var key_min = if (keys.len > 0 and random.boolean())
+                random.intRangeAtMostBiased(u32, keys[0], keys[keys.len - 1])
+            else
+                fuzz.random_int_exponential(random, u32, 100);
+
+            var key_max = if (keys.len > 0 and random.boolean())
+                random.intRangeAtMostBiased(u32, keys[0], keys[keys.len - 1])
+            else if (random.boolean())
+                key_min
+            else
+                fuzz.random_int_exponential(random, u32, 100);
+
+            if (compare_keys(key_max, key_min) == .lt) std.mem.swap(u32, &key_min, &key_max);
+            assert(compare_keys(key_min, key_max) != .gt);
+
+            break :blk .{
+                .key_min = key_min,
+                .key_max = key_max,
+            };
+        };
+
+        var expect: BinarySearchRange = .{ .start = 0, .count = 0 };
+        var key_target: enum { key_min, key_max } = .key_min;
+        for (keys) |key| {
+            if (key_target == .key_min) {
+                switch (compare_keys(key, target_range.key_min)) {
+                    .lt => if (expect.start < keys.len - 1) {
+                        expect.start += 1;
+                    },
+                    .gt, .eq => key_target = .key_max,
+                }
+            }
+
+            if (key_target == .key_max) {
+                switch (compare_keys(key, target_range.key_max)) {
+                    .lt => expect.count += 1,
+                    .eq => {
+                        expect.count += 1;
+                        break;
+                    },
+                    .gt => break,
+                }
             }
         }
 
-        const actual = binary_search_keys(
+        const actual = binary_search_keys_range(
             u32,
             compare_keys,
             keys,
-            target_key,
+            target_range.key_min,
+            target_range.key_max,
             .{ .verify = true },
         );
 
-        if (log) std.debug.print("expected: {}, actual: {}\n", .{ expect, actual });
-        try std.testing.expectEqual(expect.index, actual.index);
-        try std.testing.expectEqual(expect.exact, actual.exact);
+        if (log) std.debug.print("expected: {?}, actual: {?}\n", .{ expect, actual });
+        try std.testing.expectEqual(expect.start, actual.start);
+        try std.testing.expectEqual(expect.count, actual.count);
     }
 };
 
@@ -622,5 +657,13 @@ test "binary search: range" {
 
         const slice = empty_sequence[range.start..][0..range.count];
         try std.testing.expect(slice.len == range.count);
+    }
+}
+
+test "binary search: random range" {
+    var rng = std.rand.DefaultPrng.init(42);
+    var i: usize = 0;
+    while (i < 2048) : (i += 1) {
+        try test_binary_search.random_range_search(rng.random(), i);
     }
 }
