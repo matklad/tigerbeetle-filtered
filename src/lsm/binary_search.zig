@@ -294,36 +294,7 @@ const test_binary_search = struct {
 
         var target_key: u32 = 0;
         while (target_key < keys_count + 13) : (target_key += 1) {
-            var expect: BinarySearchResult = .{ .index = 0, .exact = false };
-            for (keys) |key, i| {
-                switch (compare_keys(key, target_key)) {
-                    .lt => expect.index = @intCast(u32, i) + 1,
-                    .eq => {
-                        expect.exact = true;
-                        break;
-                    },
-                    .gt => break,
-                }
-            }
-
-            if (log) {
-                std.debug.print("keys:", .{});
-                for (keys) |k| std.debug.print("{},", .{k});
-                std.debug.print("\n", .{});
-                std.debug.print("target key: {}\n", .{target_key});
-            }
-
-            const actual = binary_search_keys(
-                u32,
-                compare_keys,
-                keys,
-                target_key,
-                .{ .verify = true },
-            );
-
-            if (log) std.debug.print("expected: {}, actual: {}\n", .{ expect, actual });
-            try std.testing.expectEqual(expect.index, actual.index);
-            try std.testing.expectEqual(expect.exact, actual.exact);
+            _ = try binary_search_with_oracle(keys, target_key);
         }
     }
 
@@ -335,20 +306,8 @@ const test_binary_search = struct {
         assert(target_keys.len == expected_results.len);
 
         for (target_keys) |target_key, i| {
-            if (log) {
-                std.debug.print("keys:", .{});
-                for (keys) |k| std.debug.print("{},", .{k});
-                std.debug.print("\n", .{});
-                std.debug.print("target key: {}\n", .{target_key});
-            }
             const expect = expected_results[i];
-            const actual = binary_search_keys(
-                u32,
-                compare_keys,
-                keys,
-                target_key,
-                .{ .verify = true },
-            );
+            const actual = binary_search_with_oracle(keys, target_key);
             try std.testing.expectEqual(expect.index, actual.index);
             try std.testing.expectEqual(expect.exact, actual.exact);
         }
@@ -366,6 +325,20 @@ const test_binary_search = struct {
         for (keys) |*key| key.* = fuzz.random_int_exponential(random, u32, 100);
         std.sort.sort(u32, keys, {}, less_than_key);
         const target_key = fuzz.random_int_exponential(random, u32, 100);
+
+        _ = try binary_search_with_oracle(keys, target_key);
+    }
+
+    fn binary_search_with_oracle(
+        keys: []u32,
+        target_key: u32,
+    ) !BinarySearchResult {
+        if (log) {
+            std.debug.print("keys:", .{});
+            for (keys) |k| std.debug.print("{},", .{k});
+            std.debug.print("\n", .{});
+            std.debug.print("target key: {}\n", .{target_key});
+        }
 
         var expect: BinarySearchResult = .{ .index = 0, .exact = false };
         for (keys) |key, i| {
@@ -390,6 +363,7 @@ const test_binary_search = struct {
         if (log) std.debug.print("expected: {}, actual: {}\n", .{ expect, actual });
         try std.testing.expectEqual(expect.index, actual.index);
         try std.testing.expectEqual(expect.exact, actual.exact);
+        return actual;
     }
 
     pub fn range_search(
