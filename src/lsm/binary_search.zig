@@ -273,8 +273,9 @@ pub inline fn binary_search_values_range(
 
 const test_binary_search = struct {
     const fuzz = @import("../testing/fuzz.zig");
+    const Gen = @import("../testing/exhaustigen.zig").Gen;
 
-    const log = false;
+    const log = true;
 
     const gpa = std.testing.allocator;
 
@@ -294,6 +295,23 @@ const test_binary_search = struct {
 
         var target_key: u32 = 0;
         while (target_key < keys_count + 13) : (target_key += 1) {
+            _ = try binary_search_with_oracle(keys, target_key);
+        }
+    }
+
+    fn really_exhaustive_search(options: struct { max_len: u32, max_val: u32 }) !void {
+        const keys = try gpa.alloc(u32, options.max_len);
+        defer gpa.free(keys);
+
+        var g = Gen{};
+        while (!g.done()) {
+            const len = g.gen(options.max_len);
+            var prev_key: u32 = 0;
+            for (keys[0..len]) |*key| {
+                key.* = prev_key + g.gen(options.max_val - prev_key);
+                prev_key = key.*;
+            }
+            const target_key = g.gen(options.max_val);
             _ = try binary_search_with_oracle(keys, target_key);
         }
     }
@@ -463,6 +481,14 @@ test "binary search: exhaustive" {
         try test_binary_search.exhaustive_search(i);
     }
 }
+
+test "binary search: really exhaustive" {
+    try test_binary_search.really_exhaustive_search(.{
+        .max_len = 5,
+        .max_val = 5,
+    });
+}
+
 
 test "binary search: explicit" {
     if (test_binary_search.log) std.debug.print("\n", .{});

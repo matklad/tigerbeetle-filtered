@@ -33,6 +33,7 @@ test {
     _ = @import("testing/id.zig");
     _ = @import("testing/storage.zig");
     _ = @import("testing/table.zig");
+    _ = @import("testing/exhaustigen.zig");
 
     // This one is a bit sketchy: we rely on tests not actually using the `vsr` package.
     _ = @import("tigerbeetle/cli.zig");
