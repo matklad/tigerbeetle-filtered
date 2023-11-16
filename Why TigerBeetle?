@@ -1,14 +1,12 @@
-1.  Track financial transactions.
-2.  Reliable ^1
-3.  Correct ^2
+1.  Purpose: track financial transactions.
+2.  Reliability ^1
+3.  Safety ^2
 4.  Availability ^2
 5.  Efficiency   ^4
 6.  Performance  ^4, 5
-7.  Use many computers ^4,
-8.  Distributed system :(
-9.  Computers must talk to each other ^7
-10. Need networking ^9
-11. Simplicity ^3, ^4, ~5, ^8
-12. Think long term, build a mountain ^2, ^4, ^5
-13: Networking: just byte slices (over TCP, may UDP in the future?) ^9, ^11, ^12:
+7.  Distributed system ^4 (big one, fundamental complexity!)
+8.  Simplicity ^3, 4, 5, 7 (7 --- _must_ be distributed, distributed is hard, seek simplicity elsewhere)
+9.  Building for long term ^4, 5 (https://www.youtube.com/watch?v=443UNeGrFoM&t=6949s)
+
+10: Networking: just byte slices (over TCP, may UDP in the future?) ^7, 8, 9:
     <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/message_bus.zig#L699-L783>
