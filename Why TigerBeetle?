@@ -1,12 +1,50 @@
-1.  Purpose: track financial transactions.
-2.  Reliability ^1
-3.  Safety ^2
-4.  Availability ^2
-5.  Efficiency   ^4
-6.  Performance  ^4, 5
-7.  Distributed system ^4 (big one, fundamental complexity!)
-8.  Simplicity ^3, 4, 5, 7 (7 --- _must_ be distributed, distributed is hard, seek simplicity elsewhere)
-9.  Building for long term ^4, 5 (https://www.youtube.com/watch?v=443UNeGrFoM&t=6949s)
+  1.  Purpose: track financial transactions.
+  2.  Reliability ^1
+  3.  Safety ^2
+  4.  Availability ^2
+  5.  Efficiency   ^4
+  6.  Performance  ^4, 5
+* 7.  Distributed system ^4 (big one, fundamental complexity!)
+  8.  Simplicity ^3, 4, 5, 7 (7 --- _must_ be distributed, distributed is hard, seek simplicity elsewhere)
+  9.  Building for long term ^4, 5 (https://www.youtube.com/watch?v=443UNeGrFoM&t=6949s)
+  10: Mechanical Sympathy ^5
 
-10: Networking: just byte slices (over TCP, may UDP in the future?) ^7, 8, 9:
-    <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/message_bus.zig#L699-L783>
+  11: Networking: just byte slices (over TCP, may UDP in the future?) ^7, 8, 9, non-byzantine ^19
+      <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/message_bus.zig#L699-L783>
+
+* 12: Double-entry accounting ^1, 3
+      <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/state_machine.zig#L612-L698>
+      <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/tigerbeetle.zig>
+
+  13: Idempotency ^3, 4
+  14: IDs for transfers ^13
+  15: Fixed Domain model ^8, 1
+  16: Consensus ^7
+  17: Batching ^16, 6
+* 18: _Non-polymorphic_ Batches ^17, 10
+* 19: Clients are API gateways ^17
+
+
+
+end user
+             (untrusted HTTP)                               (truster byte casts)
+end user                        (a big computer in a cloud)                   (cluster of 6)
+          (public Internet)         API Gateway       (private intranet)      -> TigerBeetle
+end user                          Assembles a batch
+
+end user
+1 tarnsaction
+
+
+xx: single thread
+
+Questions:
+
+
+@DXist asks:
+
+> Have you considered to use non reference counting Message type (like OwnedMessage?) for io
+> operations that require exclusive buffer access from kernel side?
+>
+> I.e. to use owned Message for read/recv operations and not to pay some CPU cycles to maintain ref
+> counter.
