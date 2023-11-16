@@ -26,14 +26,22 @@
 
 
 
-end user
-             (untrusted HTTP)                               (truster byte casts)
-end user                        (a big computer in a cloud)                   (cluster of 6)
-          (public Internet)         API Gateway       (private intranet)      -> TigerBeetle
-end user                          Assembles a batch
 
-end user
-1 tarnsaction
+
+
+ Mobile Phone
+     v
+  End User
+                                    Big, stateless cloud computer             Stateful cluster of 6
+  End User                               V                                          V
+              --(public Internet)->     API Gateway    --(private intranet)->  TigerBeetle
+  End User       ^ untrusted HTTP                        ^ the "checksum&cast" protocol
+
+  End User
+
+Makes a payment                      Assembles a batch             Executes a batch of transactions
+
+
 
 
 xx: single thread
