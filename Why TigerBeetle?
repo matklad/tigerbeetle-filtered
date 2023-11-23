@@ -8,51 +8,42 @@
   8.  Simplicity ^3, 4, 5, 7 (7 --- _must_ be distributed, distributed is hard, seek simplicity elsewhere)
   9.  Building for long term ^4, 5 (https://www.youtube.com/watch?v=443UNeGrFoM&t=6949s)
   10: Mechanical Sympathy ^5
-
   11: Networking: just byte slices (over TCP, may UDP in the future?) ^7, 8, 9, non-byzantine ^19
       <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/message_bus.zig#L699-L783>
-
+      Episode 1 <https://www.youtube.com/watch?v=hPUL8Xo6MJw>
 * 12: Double-entry accounting ^1, 3
       <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/state_machine.zig#L612-L698>
       <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/tigerbeetle.zig>
+      Episode 2 <https://www.youtube.com/watch?v=itUzDJV3aUo>
 
   13: Idempotency ^3, 4
   14: IDs for transfers ^13
   15: Fixed Domain model ^8, 1
   16: Consensus ^7
-  17: Batching ^16, 6
-* 18: _Non-polymorphic_ Batches ^17, 10
+* 17: Batching ^16, 6
+      Episode 2 <https://www.youtube.com/watch?v=itUzDJV3aUo>
+  18: _Non-polymorphic_ Batches ^17, 10
 * 19: Clients are API gateways ^17
+      Episode 2 <https://www.youtube.com/watch?v=itUzDJV3aUo>
 
+   20: Bandwidth is limited ^10, ^5
+   21: Ring Topology for Replication: replica N replicates to replcia N+1 ^20
 
+   22: Concurrency
+   23: IO loop, evented IO, callbacks
+   24: async await where?
+   25: Concurrency between network and disk
+   26: loooots and looots of assertions
+   27: fixed number of connections, fixed number of everything else
 
+Message Flow:
 
-
-
- Mobile Phone
-     v
-  End User
-                                    Big, stateless cloud computer             Stateful cluster of 6
-  End User                               V                                          V
-              --(public Internet)->     API Gateway    --(private intranet)->  TigerBeetle
-  End User       ^ untrusted HTTP                        ^ the "checksum&cast" protocol
-
-  End User
-
-Makes a payment                      Assembles a batch             Executes a batch of transactions
-
-
-
-
-xx: single thread
-
-Questions:
-
-
-@DXist asks:
-
-> Have you considered to use non reference counting Message type (like OwnedMessage?) for io
-> operations that require exclusive buffer access from kernel side?
->
-> I.e. to use owned Message for read/recv operations and not to pay some CPU cycles to maintain ref
-> counter.
+1. Client sends a request
+2. Primary gets a request
+3. Primary converts request to prepare
+4. Replica processes prepare:
+    - replicate (to other replicas in the cluser)
+    - append (write this message to disk)
+      - when done: send PrepareOK
+5. Primary accumulates quorum of PrepareOkays
+6. Primary commits
