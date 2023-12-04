@@ -16,7 +16,7 @@
       <https://github.com/tigerbeetle/tigerbeetle/blob/0.14.160/src/tigerbeetle.zig>
       Episode 2 <https://www.youtube.com/watch?v=itUzDJV3aUo>
 
-  13: Idempotency ^3, 4
+  13: Idempotence ^3, 4
   14: IDs for transfers ^13
   15: Fixed Domain model ^8, 1
   16: Consensus ^7
@@ -25,25 +25,20 @@
   18: _Non-polymorphic_ Batches ^17, 10
 * 19: Clients are API gateways ^17
       Episode 2 <https://www.youtube.com/watch?v=itUzDJV3aUo>
+  20: Bandwidth is limited ^10, 5
+  21: Ring Topology for Replication: replica N replicates to replcia N+1 ^20
+      Episode 3 <https://youtu.be/cjaJcEgm2RI>
+  22: Linearizability: ^1, 2
+  23: Embracing Concurrency ^5 (pretty big one, fundamental for performance)
+* 24: Single-threaded-processing: ^12, 22
+      Episode 4 <https://youtu.be/W8faGPWToms>
+  25: Pipelining rather than data parallelism ^23, 24
+  26: Linux, io_uring: ^2, 6 23
 
-   20: Bandwidth is limited ^10, ^5
-   21: Ring Topology for Replication: replica N replicates to replcia N+1 ^20
 
-   22: Concurrency
-   23: IO loop, evented IO, callbacks
-   24: async await where?
-   25: Concurrency between network and disk
-   26: loooots and looots of assertions
-   27: fixed number of connections, fixed number of everything else
+Map of concurrency:
 
-Message Flow:
-
-1. Client sends a request
-2. Primary gets a request
-3. Primary converts request to prepare
-4. Replica processes prepare:
-    - replicate (to other replicas in the cluser)
-    - append (write this message to disk)
-      - when done: send PrepareOK
-5. Primary accumulates quorum of PrepareOkays
-6. Primary commits
+* peer-to-peer communication between replcias
+* hundreds of clients
+* network & disk
+* disk itself can serve many concurrent IOPs
