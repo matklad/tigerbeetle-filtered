@@ -1,3 +1,5 @@
+https://github.com/tigerbeetle/tigerbeetle/blob/IronBeetle/Why%20TigerBeetle%3F
+
   1.  Purpose: track financial transactions.
   2.  Reliability ^1
   3.  Safety ^2
@@ -35,10 +37,18 @@
   25: Pipelining rather than data parallelism ^23, 24
   26: Linux, io_uring: ^2, 6 23
 
+* 27: Static limits on everything: ^2, 4
+      Episode 5 <https://youtu.be/Tl_xqv8K3B0?si=TYdQpL7WZnHsIjem>
+  28: No dynamic memory allocation: ^27
+  29: Backpressure for free: ^28
+  30: Single request per client in flight: ^28
+  31: Hash chaining: ^30
+* 32: Parallel disk prefetch:
+      Episode 5 <https://youtu.be/Tl_xqv8K3B0?si=TYdQpL7WZnHsIjem>
 
-Map of concurrency:
-
-* peer-to-peer communication between replcias
-* hundreds of clients
-* network & disk
-* disk itself can serve many concurrent IOPs
+  33: Zero-copy no-padding IO: ^11, 3
+  34: No dependencies: ^9
+  35: Everything has 'static lifetime: ^28
+* 36: Zig:
+        not necessary Rust: ^34, 24, 35
+        Zig in particular: ^8, 33, 28

@@ -222,6 +222,7 @@ pub const ClientSessions = struct {
     ) ReplySlot {
         assert(session != 0);
         assert(header.command == .reply);
+        assert(client_sessions.count() < constants.clients_max);
         const client = header.client;
 
         defer if (constants.verify) assert(client_sessions.entries_by_client.contains(client));

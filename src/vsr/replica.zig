@@ -4434,7 +4434,11 @@ pub fn ReplicaType(
                         assert(entry.header.operation == message.header.operation);
 
                         log.debug("{}: on_request: replying to duplicate request", .{self.replica});
-                        self.on_request_repeat_reply(message, entry);
+                        if (entry.header.context == message.header.checksum) {
+                            self.on_request_repeat_reply(message, entry);
+                        } else {
+                            // Evil client
+                        }
                         return true;
                     } else {
                         log.err("{}: on_request: request collision (client bug)", .{self.replica});
