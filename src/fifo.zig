@@ -16,6 +16,17 @@ pub fn FIFO(comptime T: type) type {
         // This should only be null if you're sure we'll never want to monitor `count`.
         name: ?[]const u8,
 
+        pub fn push_front(self: *Self, elem: *T) void {
+            if (constants.verify) assert(!self.contains(elem));
+            
+            assert(elem.next == null);
+            elem.next = self.out;
+            self.out = elem;
+
+            self.count += 1;
+            self.plot();
+        }
+
         pub fn push(self: *Self, elem: *T) void {
             if (constants.verify) assert(!self.contains(elem));
 
@@ -112,6 +123,20 @@ test "FIFO: push/pop/peek/remove/empty" {
     try testing.expect(fifo.empty());
 
     fifo.push(&one);
+    try testing.expect(!fifo.empty());
+    try testing.expectEqual(@as(?*Foo, &one), fifo.peek());
+    try testing.expect(fifo.contains(&one));
+    try testing.expect(!fifo.contains(&two));
+    try testing.expect(!fifo.contains(&three));
+
+    fifo.push_front(&two);
+    try testing.expect(!fifo.empty());
+    try testing.expectEqual(@as(?*Foo, &two), fifo.peek());
+    try testing.expect(fifo.contains(&one));
+    try testing.expect(fifo.contains(&two));
+    try testing.expect(!fifo.contains(&three));
+
+    try testing.expectEqual(fifo.pop().?, &two);
     try testing.expect(!fifo.empty());
     try testing.expectEqual(@as(?*Foo, &one), fifo.peek());
     try testing.expect(fifo.contains(&one));

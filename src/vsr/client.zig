@@ -25,103 +25,25 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
         pub const Request = struct {
             pub const Callback = *const fn (
-                user_data: u128,
+                request: *Request,
                 operation: StateMachine.Operation,
                 results: []const u8,
             ) void;
 
-            pub const Demux = struct {
-                next: ?*Demux = null,
-                user_data: u128,
-                callback: ?Callback, // Null iff operation=register.
-                event_count: u16,
-                event_offset: u16,
-            };
-
-            message: *Message.Request,
-            demux_queue: FIFO(Demux) = .{ .name = null },
+            next: ?*Request,
+            callback: ?Callback,
+            body: []const u8,
+            operation: vsr.Operation,
+            queue: union(enum) {
+                root: struct {
+                    body_total: u32,
+                    batched: FIFO(Request) = .{ .name = null },
+                },
+                link: struct {
+                    body_offset: u32,
+                },
+            },
         };
-
-        pub const Batch = struct {
-            request: *Request,
-            demux: *Request.Demux,
-
-            pub fn slice(batch: Batch) []u8 {
-                // Ensure batch.demux is either the one inlined in the Request or is in demux_queue.
-                assert(batch.request.demux_queue.count > 0);
-                if (constants.verify) {
-                    if (batch.request.demux_queue.count == 1) {
-                        assert(batch.request.demux_queue.peek() == batch.demux);
-                    } else {
-                        assert(batch.request.demux_queue.contains(batch.demux));
-                    }
-                }
-
-                const message = batch.request.message;
-                assert(message.header.command == .request);
-
-                const event_size: u32 = switch (message.header.operation.cast(StateMachine)) {
-                    inline else => |operation| @sizeOf(StateMachine.Event(operation)),
-                };
-
-                const body_offset = event_size * batch.demux.event_offset;
-                const body = message.body()[body_offset..];
-                assert(@divExact(body.len, event_size) > 0);
-                return body;
-            }
-        };
-
-        /// A pool of Request.Demux nodes used for batching client events.
-        /// This uses the lazy FIFO pattern over IOPS due to the max Demux node count being large.
-        const DemuxPool = struct {
-            free: ?*Request.Demux = null,
-            memory_allocated: usize = 0,
-            memory: []Request.Demux,
-
-            /// The maximum amount of logical batches that may be queued on a client
-            /// (spread across all requests).
-            const batch_logical_max = blk: {
-                var max: usize = 1;
-                inline for (std.enums.values(StateMachine.Operation)) |operation| {
-                    if (@intFromEnum(operation) < constants.vsr_operations_reserved) continue;
-                    if (!StateMachine.batch_logical_allowed.get(operation)) continue;
-                    max = @max(max, @sizeOf(StateMachine.Result(operation)));
-                    max = @max(max, @sizeOf(StateMachine.Event(operation)));
-                }
-                break :blk max * constants.client_request_queue_max;
-            };
-
-            fn init(allocator: mem.Allocator) !DemuxPool {
-                return DemuxPool{
-                    .memory = try allocator.alloc(Request.Demux, batch_logical_max),
-                };
-            }
-
-            fn deinit(pool: *DemuxPool, allocator: mem.Allocator) void {
-                allocator.free(pool.memory);
-            }
-
-            fn acquire(pool: *DemuxPool) ?*Request.Demux {
-                if (pool.free) |demux| {
-                    pool.free = demux.next;
-                    return demux;
-                }
-                if (pool.memory_allocated < pool.memory.len) {
-                    defer pool.memory_allocated += 1;
-                    return &pool.memory[pool.memory_allocated];
-                }
-                return null;
-            }
-
-            fn release(pool: *DemuxPool, demux: *Request.Demux) void {
-                assert(@intFromPtr(demux) < @intFromPtr(pool.memory.ptr + pool.memory_allocated));
-                assert(@intFromPtr(demux) >= @intFromPtr(&pool.memory[0]));
-                demux.next = pool.free;
-                pool.free = demux;
-            }
-        };
-
-        const RequestQueue = RingBuffer(Request, .{ .array = constants.client_request_queue_max });
 
         allocator: mem.Allocator,
 
@@ -158,21 +80,16 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
         /// Used to locate the current primary, and provide more information to a partitioned primary.
         view: u32 = 0,
 
-        /// The number of messages available for requests.
-        ///
-        /// This budget is consumed by `get_message` and is replenished when a message is released.
-        ///
-        /// Note that `Client` sends a `.register` request automatically on behalf of the user, so,
-        /// until the first response is received, at most `constants.client_request_queue_max - 1`
-        /// requests can be submitted.
-        messages_available: u32 = constants.client_request_queue_max,
-
-        /// Pool of nodes which represent batched Infos on a given Request.
-        demux_pool: DemuxPool,
+        /// Message of the `*Request` that is currently being processed by the message_bus.
+        /// Corresponds to `request_queue.peek().?` and remains refererenced for duration of Client.
+        message_inflight: *Message.Request,
+        
+        /// Memory for the firt Request used by register().
+        request_register: Request = undefined,
 
         /// A client is allowed at most one inflight request at a time at the protocol layer.
         /// We therefore queue any further concurrent requests made by the application layer.
-        request_queue: RequestQueue = RequestQueue.init(),
+        request_queue: FIFO(Request) = .{ .name = "request_queue" },
 
         /// The number of ticks without a reply before the client resends the inflight request.
         /// Dynamically adjusted as a function of recent request round-trip time.
@@ -215,8 +132,8 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             );
             errdefer message_bus.deinit(allocator);
 
-            var demux_pool = try DemuxPool.init(allocator);
-            errdefer demux_pool.deinit(allocator);
+            // Reserve an inflight message upfront.
+            const message_inflight = message_bus.get_message(.request);
 
             var self = Self{
                 .allocator = allocator,
@@ -224,7 +141,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 .id = id,
                 .cluster = cluster,
                 .replica_count = replica_count,
-                .demux_pool = demux_pool,
+                .message_inflight = message_inflight,
                 .request_timeout = .{
                     .name = "request_timeout",
                     .id = id,
@@ -244,11 +161,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            while (self.request_queue.pop()) |inflight| {
-                self.release(inflight.message.base());
-            }
-            assert(self.messages_available == constants.client_request_queue_max);
-            self.demux_pool.deinit(allocator);
+            self.message_bus.unref(self.message_inflight.base());
             self.message_bus.deinit(allocator);
         }
 
@@ -293,232 +206,75 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             if (self.request_timeout.fired()) self.on_request_timeout();
         }
 
-        pub const BatchError = error{
-            // There are not enough internal resources (Messages or Demux) to allocate
-            // a batched Request.
-            TooManyOutstanding,
-        };
-
-        /// Allocate space in a vsr Message to write [event_count]StateMachine.Event(operation).
-        /// Unlike `raw_request`, a Batch will attempt to piggy-back onto an existing Message.
-        /// The returned Batch provides a slice of memory to write the events to. Once populated,
-        /// use `batch_submit` to commit the writes to the Message and send it through the Client.
-        /// NOTE: A Batch cannot be stored and must be passed to batch_submit() before calling
-        /// any other methods on the Client.
-        pub fn batch_get(
+        pub fn submit(
             self: *Self,
+            callback: Request.Callback,
+            request: *Request,
             operation: StateMachine.Operation,
-            event_count: usize,
-        ) BatchError!Batch {
+            event_data: []const u8,
+        ) void {
             assert(@intFromEnum(operation) >= constants.vsr_operations_reserved);
             const event_size: usize = switch (operation) {
                 inline else => |operation_comptime| @sizeOf(StateMachine.Event(operation_comptime)),
             };
 
-            const body_size = event_size * event_count;
-            assert(body_size <= constants.message_body_size_max);
+            assert(event_data.len <= constants.message_body_size_max);
+            assert(@divExact(event_data.len, event_size) > 0);
 
-            // A demux node is always reserved, either for the initial Request or a tag-along demux.
-            const demux = self.demux_pool.acquire() orelse return error.TooManyOutstanding;
-            errdefer self.demux_pool.release(demux);
-
-            demux.* = .{
-                .user_data = undefined, // Set during batch_submit().
-                .callback = undefined, // Set during batch_submit().
-                .event_count = @intCast(event_count),
-                // Assume the first demux here. Updated if enqueued onto an existing Request.
-                .event_offset = 0,
+            request.* = .{
+                .next = null,
+                .callback = callback,
+                .body = event_data,
+                .operation = vsr.Operation.from(StateMachine, operation),
+                .queue = undefined,
             };
 
-            // Check-in with the StateMachine to see if this operation can even be batched.
+            // Check-in with the StateMachine to see if this operation should even be batched.
             // If so, find an existing Request with the same Op that has room in its Message.
             if (StateMachine.batch_logical_allowed.get(operation)) {
-                var it = self.request_queue.iterator_mutable();
-
+                var it = self.request_queue.peek();
+                
                 // The request must not be the one currently inflight in VSR as its Message is
                 // being sent over the MessageBus and waiting for a reasponse.
-                _ = it.next_ptr();
+                if (it) |inflight| {
+                    it = inflight.next;
+                }
 
-                while (it.next_ptr()) |request| {
-                    if (request.message.header.operation.cast(StateMachine) != operation) continue;
-                    if (request.message.header.size + body_size > constants.message_size_max) continue;
+                while (it) |inflight| {
+                    it = inflight.next;
 
-                    // Set the demux offset to be at the end of the current request's Message body.
-                    demux.event_offset = @intCast(@divExact(request.message.body().len, event_size));
-                    assert(demux.event_offset > 0);
+                    const root = &inflight.queue.root;
+                    if (inflight.operation.cast(StateMachine) != operation) continue;
+                    if (root.body_total + request.body.len > constants.message_size_max) continue;
 
-                    // Then, extend the message to contain the Batch data as if already written.
-                    // This allows Batch.slice() to simply use message.body().
-                    request.message.header.size += @intCast(body_size);
-                    assert(request.message.header.size <= constants.message_size_max);
-
-                    assert(request.demux_queue.count >= 1);
-                    request.demux_queue.push(demux);
-                    return Batch{
-                        .request = request,
-                        .demux = demux,
+                    // Set the new offset to be at the end of the current inflight's Message body.
+                    request.queue = .{
+                        .link = .{
+                            .body_offset = root.body_total,
+                        },
                     };
+
+                    root.body_total += @intCast(request.body.len);
+                    root.batched.push(request);
+                    return;
                 }
             }
 
-            // Unable to batch the events to an existing Message so reserve a new one.
-            if (self.messages_available == 0) return error.TooManyOutstanding;
-            const message = self.get_message();
-            errdefer self.release(message);
-
-            // We will set parent, session, view and checksums only when sending for the first time:
-            const message_request = message.build(.request);
-            message_request.header.* = .{
-                .client = self.id,
-                .request = undefined,
-                .cluster = self.cluster,
-                .command = .request,
-                .operation = vsr.Operation.from(StateMachine, operation),
-                .size = @intCast(@sizeOf(Header) + body_size),
-            };
-
-            // Register before appending to request_queue.
+            // Make sure to register before pushing a new Request to the request_queue.
             self.register();
-            assert(self.request_number > 0);
-            message_request.header.request = self.request_number;
-            self.request_number += 1;
 
-            // If we were able to reserve a Message, we can also enqueue a new Request.
-            assert(!self.request_queue.full());
-            self.request_queue.push_assume_capacity(.{
-                .message = message_request,
-            });
-
-            const request = self.request_queue.tail_ptr().?;
-            assert(request.demux_queue.empty());
-            request.demux_queue.push(demux);
-            return Batch{
-                .request = request,
-                .demux = demux,
+            request.queue = .{
+                .root = .{
+                    .body_total = @intCast(request.body.len),
+                },
             };
-        }
 
-        /// After writing Events to batch.slice(), mark the batched data as sendable with a callback
-        /// and user_data for when it completes. This may also start sending the Batch's message
-        /// through VSR.
-        pub fn batch_submit(
-            self: *Self,
-            user_data: u128,
-            callback: Request.Callback,
-            batch: Batch,
-        ) void {
-            assert(batch.request.demux_queue.count > 0);
-            assert(batch.request.message.body().len > 0);
-            assert(batch.request.message.header.command == .request);
-
-            batch.demux.user_data = user_data;
-            batch.demux.callback = callback;
-
-            // Newly made Requests are populated and potentially pushed through VSR if there exists
-            // no currently inflight request.
-            // A Batch is newly made if its Request only contains its Demux.
-            if (batch.request.demux_queue.count == 1) {
-                assert(batch.request.demux_queue.peek() == batch.demux);
-                self.request_submit(batch.request);
+            self.request_queue.push(request);
+            if (self.request_queue.peek() == request) {
+                self.send_request_for_the_first_time(request);
             }
         }
-
-        /// Sends a request, only setting request_number in the header. Currently only used by
-        /// AOF replay support to replay messages with timestamps.
-        pub fn raw_request(
-            self: *Self,
-            user_data: u128,
-            callback: Request.Callback,
-            message: *Message.Request,
-        ) void {
-            assert(!message.header.operation.vsr_reserved());
-            assert(self.messages_available < constants.client_request_queue_max);
-
-            const event_size: usize = switch (message.header.operation.cast(StateMachine)) {
-                inline else => |operation| @sizeOf(StateMachine.Event(operation)),
-            };
-
-            // Assume that the caller ensures there will be Demux nodes available for the message.
-            const demux = self.demux_pool.acquire() orelse unreachable;
-            errdefer self.demux_pool.release(demux);
-
-            demux.* = .{
-                .user_data = user_data,
-                .callback = callback,
-                .event_count = @intCast(@divExact(message.body().len, event_size)),
-                .event_offset = 0,
-            };
-
-            // Register before appending to request_queue.
-            self.register();
-            assert(self.request_number > 0);
-            message.header.request = self.request_number;
-            self.request_number += 1;
-
-            // If there was a reserved message, we should also be able to reserve a Request.
-            assert(!self.request_queue.full());
-            self.request_queue.push_assume_capacity(.{
-                .message = message,
-            });
-
-            // Populate the newly made Request and potentially push it through VSR if no inflight.
-            const request = self.request_queue.tail_ptr().?;
-            request.demux_queue.push(demux);
-            self.request_submit(request);
-        }
-
-        /// Try to submit a well-prepared Request in request_queue to VSR.
-        fn request_submit(self: *Self, request: *Request) void {
-            assert(!self.request_queue.empty());
-            assert(self.request_queue.tail_ptr().? == request);
-
-            assert(request.demux_queue.count > 0);
-
-            const message = request.message;
-            assert(self.messages_available < constants.client_request_queue_max);
-            assert(message.header.client == self.id);
-            assert(message.header.request > 0);
-            assert(message.header.request < self.request_number);
-            assert(message.header.cluster == self.cluster);
-            assert(message.header.command == .request);
-            assert(message.header.size >= @sizeOf(Header));
-            assert(message.header.size <= constants.message_size_max);
-
-            log.debug("{}: request: user_data={} request={} size={} {s}", .{
-                self.id,
-                request.demux_queue.peek().?.user_data,
-                message.header.request,
-                message.header.size,
-                message.header.operation.tag_name(StateMachine),
-            });
-
-            // Send the Request's message through VSR if there are no other Requests pending.
-            if (self.request_queue.head_ptr().? == request) {
-                self.send_request_for_the_first_time(message);
-            }
-        }
-
-        /// Acquires a message from the message bus.
-        /// The caller must ensure that a message is available.
-        ///
-        /// Either use it in `client.raw_request()` or discard via `client.release()`,
-        /// the reference is not guaranteed to be valid after both actions.
-        /// Do NOT use the reference counter function `message.ref()` for storing the message.
-        pub fn get_message(self: *Self) *Message {
-            assert(self.messages_available > 0);
-            self.messages_available -= 1;
-
-            return self.message_bus.get_message(null);
-        }
-
-        /// Releases a message back to the message bus.
-        pub fn release(self: *Self, message: *Message) void {
-            assert(self.messages_available < constants.client_request_queue_max);
-            self.messages_available += 1;
-
-            self.message_bus.unref(message);
-        }
-
+        
         fn on_eviction(self: *Self, eviction: *const Message.Eviction) void {
             assert(eviction.header.command == .eviction);
             assert(eviction.header.cluster == self.cluster);
@@ -578,41 +334,26 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 return;
             }
 
-            if (self.request_queue.head_ptr()) |inflight| {
-                if (reply.header.request < inflight.message.header.request) {
-                    log.debug("{}: on_reply: ignoring (request {} < {})", .{
-                        self.id,
-                        reply.header.request,
-                        inflight.message.header.request,
-                    });
-                    return;
-                }
-            } else {
+            const inflight = self.request_queue.peek() orelse {
                 log.debug("{}: on_reply: ignoring (no inflight request)", .{self.id});
+                return;
+            };
+            
+            if (reply.header.request < self.message_inflight.header.request) {
+                log.debug("{}: on_reply: ignoring (request {} < {})", .{
+                    self.id,
+                    reply.header.request,
+                    self.message_inflight.header.request,
+                });
                 return;
             }
 
-            var inflight = self.request_queue.pop().?;
-            const inflight_request = inflight.message.header.request;
-            const inflight_vsr_operation = inflight.message.header.operation;
-
             if (self.on_reply_callback) |on_reply_callback| {
-                on_reply_callback(self, inflight.message, reply);
+                on_reply_callback(self, self.message_inflight, reply);
             }
 
-            // Eagerly release request message, to ensure that user's callback can submit a new
-            // request.
-            self.release(inflight.message.base());
-            assert(self.messages_available > 0);
-
-            // Even though we release our reference to the message, we might have another one
-            // retained by the send queue in case of timeout.
-            maybe(inflight.message.references > 0);
-            inflight.message = undefined;
-
-            log.debug("{}: on_reply: user_data={} request={} size={} {s}", .{
+            log.debug("{}: on_reply: request={} size={} {s}", .{
                 self.id,
-                inflight.demux_queue.peek().?.user_data,
                 reply.header.request,
                 reply.header.size,
                 reply.header.operation.tag_name(StateMachine),
@@ -620,10 +361,10 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
             assert(reply.header.parent == self.parent);
             assert(reply.header.client == self.id);
-            assert(reply.header.request == inflight_request);
+            assert(reply.header.request == self.message_inflight.header.request);
             assert(reply.header.cluster == self.cluster);
             assert(reply.header.op == reply.header.commit);
-            assert(reply.header.operation == inflight_vsr_operation);
+            assert(reply.header.operation == inflight.operation);
 
             // The context of this reply becomes the parent of our next request:
             self.parent = reply.header.context;
@@ -639,7 +380,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
             self.request_timeout.stop();
 
-            if (inflight_vsr_operation == .register) {
+            if (inflight.operation == .register) {
                 assert(self.session == 0);
                 assert(reply.header.commit > 0);
                 self.session = reply.header.commit; // The commit number becomes the session number.
@@ -647,42 +388,54 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
             // We must start the next request before releasing control back to the callback(s).
             // Otherwise, requests may never run through send_request_for_the_first_time().
-            if (self.request_queue.head_ptr()) |request| {
-                self.send_request_for_the_first_time(request.message);
+            assert(inflight == self.request_queue.pop().?);
+            if (self.request_queue.peek()) |request| {
+                self.send_request_for_the_first_time(request);
             }
 
             // Ignore callback processing if the Request was from register().
-            if (inflight_vsr_operation == .register) {
-                const demux = inflight.demux_queue.pop().?;
-                assert(inflight.demux_queue.peek() == null);
-                assert(demux.user_data == 0);
-                assert(demux.callback == null);
-                self.demux_pool.release(demux);
+            if (inflight.operation == .register) {
+                assert(inflight.callback == null);
+                assert(inflight.body.len == 0);
+                assert(inflight.queue.root.batched.empty());
                 return;
             }
 
-            assert(!inflight_vsr_operation.vsr_reserved());
-            switch (inflight_vsr_operation.cast(StateMachine)) {
+            assert(!inflight.operation.vsr_reserved());
+            switch (inflight.operation.cast(StateMachine)) {
                 inline else => |operation| {
                     var demuxer = StateMachine.DemuxerType(operation).init(
                         std.mem.bytesAsSlice(StateMachine.Result(operation), reply.body()),
                     );
 
-                    while (inflight.demux_queue.pop()) |demux| {
+                    // Push the root as first to its batched list to keep demux processing simpler.
+                    // Use a copy of `batched` as the Request is invalidated on its last callback.
+                    var batched = inflight.queue.root.batched;
+                    batched.push_front(inflight);
+                    inflight.queue = .{
+                        .link = .{
+                            .body_offset = 0,
+                        },
+                    };
+
+                    while (batched.pop()) |request| {
+                        assert(request.callback != null);
+                        assert(request.body.len > 0);
+                        assert(request.operation.cast(StateMachine) == operation);
+                        assert(request.queue == .link);
+
+                        const event_size = @sizeOf(StateMachine.Event(operation));
+                        const event_count = @divExact(request.body.len, event_size);
+                        const event_offset = @divExact(request.queue.link.body_offset, event_size);
+
                         // Extract/use the Demux node info to slice the results from the reply.
-                        const decoded = demuxer.decode(demux.event_offset, demux.event_count);
+                        const decoded = demuxer.decode(@intCast(event_offset), @intCast(event_count));
                         const response = std.mem.sliceAsBytes(decoded);
                         if (!StateMachine.batch_logical_allowed.get(operation)) {
                             assert(response.len == reply.body().len);
                         }
 
-                        // Free the Demux node before invoking the callback in case it calls
-                        // batch_get() and wants a Demux node as well.
-                        const user_data = demux.user_data;
-                        const callback = demux.callback.?;
-                        self.demux_pool.release(demux);
-
-                        callback(user_data, operation, response);
+                        request.callback.?(request, request.operation.cast(StateMachine), response);
                     }
                 },
             }
@@ -704,9 +457,9 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
         fn on_request_timeout(self: *Self) void {
             self.request_timeout.backoff(self.prng.random());
 
-            const inflight = self.request_queue.head_ptr().?;
+            const message = self.message_inflight;
+            assert(self.request_queue.peek() != null);
 
-            const message = inflight.message;
             assert(message.header.command == .request);
             assert(message.header.request < self.request_number);
             assert(message.header.checksum == self.parent);
@@ -742,45 +495,27 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
         /// Registers a session with the cluster for the client, if this has not yet been done.
         fn register(self: *Self) void {
+            // Incremented by send_request_for_the_first_time() down below.
             if (self.request_number > 0) return;
 
-            const demux = self.demux_pool.acquire().?;
-            errdefer self.demux_pool.release(demux);
-
-            demux.* = .{
-                .user_data = 0,
-                .callback = null,
-                .event_count = 0,
-                .event_offset = 0,
-            };
-
-            const message = self.get_message().build(.request);
-            errdefer self.release(message);
-
-            // We will set parent, session, view and checksums only when sending for the first time:
-            message.header.* = .{
-                .client = self.id,
-                .request = self.request_number,
-                .cluster = self.cluster,
-                .command = .request,
-                .operation = .register,
-            };
-
-            assert(self.request_number == 0);
-            self.request_number += 1;
-
             log.debug("{}: register: registering a session with the cluster", .{self.id});
+            
+            const request = &self.request_register;
+            request.* = .{
+                .next = null,
+                .callback = null,
+                .body = &.{},
+                .operation = .register,
+                .queue = .{
+                    .root = .{
+                        .body_total = 0,
+                    },
+                },
+            };
 
             assert(self.request_queue.empty());
-            self.request_queue.push_assume_capacity(.{
-                .message = message,
-            });
-
-            const request = self.request_queue.head_ptr().?;
-            assert(self.request_queue.tail_ptr() == request);
-            request.demux_queue.push(demux);
-
-            self.send_request_for_the_first_time(message);
+            self.request_queue.push(request);
+            self.send_request_for_the_first_time(request);
         }
 
         fn send_header_to_replica(self: *Self, replica: u8, header: Header) void {
@@ -822,16 +557,50 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             self.message_bus.send_message_to_replica(replica, message);
         }
 
-        fn send_request_for_the_first_time(self: *Self, message: *Message.Request) void {
-            assert(self.request_queue.head_ptr().?.message == message);
+        fn send_request_for_the_first_time(self: *Self, request: *Request) void {
+            assert(self.request_queue.peek() == request);
 
-            assert(message.header.command == .request);
-            assert(message.header.parent == 0);
-            assert(message.header.session == 0);
-            assert(message.header.request < self.request_number);
-            assert(message.header.view == 0);
+            const message = self.message_inflight;
+            message.header.* = .{
+                .client = self.id,
+                .request = self.request_number,
+                .cluster = self.cluster,
+                .command = .request,
+                .operation = request.operation,
+                .size = @sizeOf(Header),
+            };
+
+            // Bump the request number for each newly sent request.
+            assert(self.request_number > 0 or request.operation == .register);
+            self.request_number += 1;
+
+            // First, copy the root Request's body into the message.
+            message.header.size += @intCast(request.body.len);
+            stdx.copy_disjoint(.exact, u8, message.body(), request.body);
+
+            // Then, copy the body's of batched Requests into the message.
+            var it = request.queue.root.batched.peek();
+            while (it) |batched| {
+                it = batched.next;
+
+                const body_offset = batched.queue.link.body_offset;
+                assert(message.body().len == body_offset);
+
+                message.header.size += @intCast(batched.body.len);
+                assert(message.header.size <= constants.message_size_max);
+
+                stdx.copy_disjoint(.exact, u8, message.body()[body_offset..], batched.body);
+            }
+
             assert(message.header.size <= constants.message_size_max);
-            assert(self.messages_available < constants.client_request_queue_max);
+            assert(message.body().len == request.queue.root.body_total);
+
+            log.debug("{}: request: request={} size={} {s}", .{
+                self.id,
+                message.header.request,
+                message.header.size,
+                message.header.operation.tag_name(StateMachine),
+            });
 
             // We set the message checksums only when sending the request for the first time,
             // which is when we have the checksum of the latest reply available to set as `parent`,
@@ -1075,26 +844,25 @@ test "Client Batching" {
     const events_serial_max = @divExact(constants.message_body_size_max, @sizeOf(Event(.serial)));
     const events_batched_max = @divExact(constants.message_body_size_max, @sizeOf(Event(.batched)));
 
-    // Submits batches to the VSRClient and checks messages_available based on Submissions.
+    // Submits batches to the VSRClient.
     const Context = struct {
         client: VSRClient,
-        messages_reserved: u32 = 0,
+        requests_created: u32 = 0,
 
         /// Tracks highest Submission.user_id which completed in its callback.
         var highest_user_id: u128 = 0;
 
-        const Submission = struct {
+        const Request = struct {
+            vsr_request: VSRClient.Request,
+            user_id: u128,
+        };
+
+        fn submit(self: *@This(), comptime submission: struct {
             operation: StateMachine.Operation,
             event_count: usize,
             user_id: u128,
-            messages_reserved: u32,
-        };
-
-        fn submit(self: *@This(), comptime submission: Submission) !void {
-            const batch = try self.client.batch_get(
-                submission.operation,
-                @intCast(submission.event_count),
-            );
+            requests_created: u32,
+        }) !void {
             const events = switch (submission.operation) {
                 inline else => |operation| blk: {
                     const event_size = @sizeOf(Event(operation));
@@ -1102,11 +870,18 @@ test "Client Batching" {
                     break :blk std.mem.zeroes([event_max]Event(operation));
                 },
             };
-            @memcpy(batch.slice(), std.mem.sliceAsBytes(events[0..submission.event_count]));
 
             const callback = struct {
-                pub fn callback(user_id: u128, op: StateMachine.Operation, reply: []const u8) void {
-                    assert(op == submission.operation);
+                pub fn callback(
+                    vsr_request: *VSRClient.Request,
+                    operation: StateMachine.Operation,
+                    reply: []const u8,
+                ) void {
+                    const request = @fieldParentPtr(Request, "vsr_request", vsr_request);
+                    const user_id = request.user_id;
+                    allocator.destroy(request);
+
+                    assert(operation == submission.operation);
                     assert(user_id == submission.user_id);
                     highest_user_id = @max(highest_user_id, user_id);
 
@@ -1114,11 +889,24 @@ test "Client Batching" {
                     assert(reply.len == result_size * submission.event_count);
                 }
             }.callback;
-            self.client.batch_submit(submission.user_id, callback, batch);
 
-            self.messages_reserved += submission.messages_reserved;
-            const messages_available = constants.client_request_queue_max - self.messages_reserved;
-            assert(self.client.messages_available == messages_available);
+            const request = try allocator.create(Request);
+            errdefer allocator.destroy(request);
+
+            request.* = .{
+                .vsr_request = undefined,
+                .user_id = submission.user_id,
+            };
+
+            self.client.submit(
+                callback,
+                &request.vsr_request,
+                submission.operation,
+                events,
+            );
+
+            self.requests_created += submission.requests_created;
+            assert(self.client.request_queue.count == self.requests_created);
         }
     };
 
@@ -1128,68 +916,68 @@ test "Client Batching" {
     var ctx = Context{ .client = try VSRClient.init(allocator, 1, 0, 1, &message_pool, .{}) };
     defer ctx.client.deinit(allocator);
 
-    // Make sure all messages are available at the start.
+    // Make sure no requests are created the start.
     comptime var last_user_id: u128 = 0;
-    assert(ctx.client.messages_available == constants.client_request_queue_max);
+    assert(ctx.client.request_queue.empty());
 
     // New request with op that is batchable, with one more slot until it fills up.
-    // Ensure this reserves TWO messages (one for register(), one for .batched).
+    // Ensure this enqueues TWO requests (one for register(), one for .batched).
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .batched,
         .event_count = events_batched_max - 1,
         .user_id = last_user_id,
-        .messages_reserved = 2,
+        .requests_created = 2,
     });
 
     // New request with op that is NOT batchable.
-    // Ensure it reserves a new message, unrelated to the previous .batched.
+    // Ensure it enqueues a new request, unrelated to the previous .batched.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .serial,
         .event_count = events_serial_max - 1,
         .user_id = last_user_id,
-        .messages_reserved = 1,
+        .requests_created = 1,
     });
 
     // New request with a single batchable op.
-    // Ensure no new messages as it should get merged with the previous batchable op to fill it.
+    // Ensure no new requests as it should get merged with the previous batchable op to fill it.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .batched,
         .event_count = 1,
         .user_id = last_user_id,
-        .messages_reserved = 0,
+        .requests_created = 0,
     });
 
     // Another new request with a batchable op.
-    // Ensure this creates a NEW message as the previous batch should've been filled up.
+    // Ensure this creates a NEW request as the previous batch should've been filled up.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .batched,
         .event_count = 1,
         .user_id = last_user_id,
-        .messages_reserved = 1,
+        .requests_created = 1,
     });
 
     // Another new request with an op that's NOT batchable.
-    // Ensure this creates a NEW message, not batched with previous .sreial that had extra room.
+    // Ensure this creates a NEW request, not batched with previous .sreial that had extra room.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .serial,
         .event_count = 1,
         .user_id = last_user_id,
-        .messages_reserved = 1,
+        .requests_created = 1,
     });
 
     // Final new request with a batchable op.
-    // Ensure this gets merged with the other .batched instead of creating a new message.
+    // Ensure this gets merged with the other .batched instead of creating a new request.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .batched,
         .event_count = 1,
         .user_id = last_user_id,
-        .messages_reserved = 0,
+        .requests_created = 0,
     });
 
     while (Context.highest_user_id != last_user_id) {
