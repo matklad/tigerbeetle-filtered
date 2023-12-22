@@ -228,7 +228,7 @@ pub fn StateMachineType(
             .posted = PostedGroove,
         });
 
-        const TransfersScanLookup = ScanLookupType(TransfersGroove, Storage);
+        const TransfersScanLookup = void; //ScanLookupType(TransfersGroove, Storage);
 
         pub const Operation = enum(u8) {
             /// Operations exported by TigerBeetle:
@@ -593,62 +593,63 @@ pub fn StateMachineType(
 
             const transfers_groove: *TransfersGroove = &self.forest.grooves.transfers;
             const scan_builder: *TransfersGroove.ScanBuilder = &transfers_groove.scan_builder;
+            _ = scan_builder;
 
-            var scan = scan: {
-                // Getting the timestamp range according to the direction:
-                const direction: Direction = if (filter.flags.reversed) .descending else .ascending;
-                const timestamp_range = if (filter.timestamp == 0)
-                    TimestampRange.all()
-                else switch (direction) {
-                    // The `timestamp` filter is an exclusive range,
-                    // so the user can use the last seen timestamp to get the next block of results:
-                    .ascending => TimestampRange.gte(filter.timestamp + 1),
-                    .descending => TimestampRange.lte(filter.timestamp - 1),
-                };
+            // var scan = scan: {
+            //     // Getting the timestamp range according to the direction:
+            //     const direction: Direction = if (filter.flags.reversed) .descending else .ascending;
+            //     const timestamp_range = if (filter.timestamp == 0)
+            //         TimestampRange.all()
+            //     else switch (direction) {
+            //         // The `timestamp` filter is an exclusive range,
+            //         // so the user can use the last seen timestamp to get the next block of results:
+            //         .ascending => TimestampRange.gte(filter.timestamp + 1),
+            //         .descending => TimestampRange.lte(filter.timestamp - 1),
+            //     };
 
-                // This query may have 2 conditions:
-                // `WHERE debit_account_id = $account_id OR credit_account_id = $account_id`.
-                var scan_conditions: stdx.BoundedArray(*TransfersGroove.ScanBuilder.Scan, 2) = .{};
+            //     // This query may have 2 conditions:
+            //     // `WHERE debit_account_id = $account_id OR credit_account_id = $account_id`.
+            //     var scan_conditions: stdx.BoundedArray(*TransfersGroove.ScanBuilder.Scan, 2) = .{};
 
-                // Adding the condition for `debit_account_id = $account_id`.
-                if (filter.flags.debits) {
-                    scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
-                        .debit_account_id,
-                        self.forest.scan_buffer_pool.acquire_assume_capacity(),
-                        snapshot_latest,
-                        filter.account_id,
-                        timestamp_range,
-                        direction,
-                    ));
-                }
+            //     // Adding the condition for `debit_account_id = $account_id`.
+            //     if (filter.flags.debits) {
+            //         scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
+            //             .debit_account_id,
+            //             self.forest.scan_buffer_pool.acquire_assume_capacity(),
+            //             snapshot_latest,
+            //             filter.account_id,
+            //             timestamp_range,
+            //             direction,
+            //         ));
+            //     }
 
-                // Adding the condition for `credit_account_id = $account_id`.
-                if (filter.flags.credits) {
-                    scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
-                        .credit_account_id,
-                        self.forest.scan_buffer_pool.acquire_assume_capacity(),
-                        snapshot_latest,
-                        filter.account_id,
-                        timestamp_range,
-                        direction,
-                    ));
-                }
+            //     // Adding the condition for `credit_account_id = $account_id`.
+            //     if (filter.flags.credits) {
+            //         scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
+            //             .credit_account_id,
+            //             self.forest.scan_buffer_pool.acquire_assume_capacity(),
+            //             snapshot_latest,
+            //             filter.account_id,
+            //             timestamp_range,
+            //             direction,
+            //         ));
+            //     }
 
-                break :scan switch (scan_conditions.count()) {
-                    1 => scan_conditions.get(0),
-                    // Creating an union `OR` with the conditions.
-                    2 => scan_builder.merge_union(scan_conditions.const_slice()),
-                    else => unreachable,
-                };
-            };
+            //     break :scan switch (scan_conditions.count()) {
+            //         1 => scan_conditions.get(0),
+            //         // Creating an union `OR` with the conditions.
+            //         2 => scan_builder.merge_union(scan_conditions.const_slice()),
+            //         else => unreachable,
+            //     };
+            // };
 
             // Initializing a lookup for the `Transfers` found by the scan:
-            self.scan_lookup = TransfersScanLookup.init(transfers_groove, scan);
-            self.scan_lookup.read(
-                // Limiting the buffer size according to the query limit.
-                self.scan_buffer[0..@min(filter.limit, self.scan_buffer.len)],
-                &scan_account_transfers_callback,
-            );
+            // self.scan_lookup = TransfersScanLookup.init(transfers_groove, scan);
+            // self.scan_lookup.read(
+            //     // Limiting the buffer size according to the query limit.
+            //     self.scan_buffer[0..@min(filter.limit, self.scan_buffer.len)],
+            //     &scan_account_transfers_callback,
+            // );
         }
 
         fn scan_account_transfers_validation_callback(completion: *Grid.NextTick) void {

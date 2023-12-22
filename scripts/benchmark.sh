@@ -64,7 +64,7 @@ for I in $REPLICAS
 do
     echo "Starting replica $I..."
     FILE="./0_${I}.tigerbeetle.benchmark"
-    ./tigerbeetle start "--addresses=${PORT}" "$FILE" >> benchmark.log 2>&1 &
+    ./tigerbeetle start "--addresses=${PORT}" "$FILE"  &
 done
 
 echo ""

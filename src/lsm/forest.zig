@@ -11,6 +11,7 @@ const vsr = @import("../vsr.zig");
 
 const schema = @import("schema.zig");
 const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtr = @import("../vsr/grid.zig").BlockPtr;
 const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
@@ -180,7 +181,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         manifest_log: ManifestLog,
         manifest_log_progress: enum { idle, compacting, done, skip } = .idle,
 
-        compaction_blocks: []Grid.BlockPtr,
+        compaction_blocks: []BlockPtr,
         compaction_reads: []Grid.FatRead,
         compaction_writes: []Grid.FatWrite,
 
@@ -228,7 +229,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 grooves_initialized += 1;
             }
 
-            const compaction_blocks = try allocator.alloc(Grid.BlockPtr, 1024);
+            const compaction_blocks = try allocator.alloc(BlockPtr, 1024);
             errdefer allocator.free(compaction_blocks);
 
             for (compaction_blocks, 0..) |*cache_block, i| {
@@ -368,8 +369,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         const work = compaction.bar_setup(tree, op);
                         _ = work;
 
-                        // FIXME: Make method
-                        compaction.bar_context.?.beat_target = 32;
+                        compaction.bar_setup_budget(32, forest.compaction_blocks[32..48]);
                     }
 
                     if (op > constants.lsm_batch_multiple) {
@@ -377,7 +377,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         _ = compaction.beat_setup(.{
                             .input_index_blocks = forest.compaction_blocks[0..16],
                             .input_data_blocks = forest.compaction_blocks[16..32],
-                            .output_index_blocks = forest.compaction_blocks[32..48],
                             .output_data_blocks = forest.compaction_blocks[48..64],
                             .grid_reads = forest.compaction_reads[0..32],
                             .grid_writes = forest.compaction_writes[0..32],

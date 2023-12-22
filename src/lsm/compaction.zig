@@ -1,6 +1,6 @@
-//! Compaction moves or merges a table's values into the next level.
+//! Compaction moves or merges a table's values from the previous level.
 //!
-//! Each Compaction is paced to run in one half-bar.
+//! Each Compaction is paced to run in an arbitrary amount of beats, by the forest.
 //!
 //!
 //! Compaction overview:
@@ -14,7 +14,7 @@
 //!
 //! 2. If table A's key range is disjoint from the keys in level B, move table A into level B.
 //!    All done! (But if the key ranges intersect, jump to step 3).
-//!
+//! FIXME: Update
 //! 3. Create an iterator from the sort-merge of table A and the concatenation of tables B.
 //!    If the same key exists in level A and B, take A's and discard B's. †
 //!
@@ -43,12 +43,12 @@ const constants = @import("../constants.zig");
 
 const stdx = @import("../stdx.zig");
 const GridType = @import("../vsr/grid.zig").GridType;
+const BlockPtr = @import("../vsr/grid.zig").BlockPtr;
+const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
 const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const TableInfoType = @import("manifest.zig").TreeTableInfoType;
 const ManifestType = @import("manifest.zig").ManifestType;
 const schema = @import("schema.zig");
-const TableDataIteratorType = @import("table_data_iterator.zig").TableDataIteratorType;
-const LevelTableValueBlockIteratorType = @import("level_data_iterator.zig").LevelTableValueBlockIteratorType;
 
 /// The upper-bound count of input tables to a single tree's compaction.
 ///
@@ -71,25 +71,25 @@ pub fn CompactionType(
         const Compaction = @This();
 
         const Grid = GridType(Storage);
-        const BlockPtr = Grid.BlockPtr;
-        const BlockPtrConst = Grid.BlockPtrConst;
 
-        const TableInfo = TableInfoType(Table);
         const Manifest = ManifestType(Table, Storage);
+        const TableInfo = TableInfoType(Table);
+        const TableInfoReference = Manifest.TableInfoReference;
         const CompactionRange = Manifest.CompactionRange;
-        const TableDataIterator = TableDataIteratorType(Storage);
-        const LevelTableValueBlockIterator = LevelTableValueBlockIteratorType(Table, Storage);
 
         const Key = Table.Key;
         const Value = Table.Value;
         const key_from_value = Table.key_from_value;
         const tombstone = Table.tombstone;
 
-        const TableInfoReference = Manifest.TableInfoReference;
-
-        pub const TableInfoA = union(enum) {
+        const TableInfoA = union(enum) {
             immutable: []const Value,
             disk: TableInfoReference,
+        };
+
+        const CompactionInfo = struct {
+            table_info_a: TableInfoA,
+            range_b: CompactionRange,
         };
 
         const Stage = union(enum) {
@@ -133,11 +133,30 @@ pub fn CompactionType(
             drop_tombstones: bool,
 
             /// Number of beats required to finish this compaction.
-            /// FIXME: Rename to beat_budget
-            beat_target: ?u64,
+            beat_budget: ?u64,
 
             /// Number of beats we've executed.
             beat_count: u64,
+
+            output_index_blocks: []BlockPtr,
+
+            /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
+            /// they are applied deterministically relative to other concurrent compactions.
+            manifest_entries: stdx.BoundedArray(struct {
+                operation: enum {
+                    insert_to_level_b,
+                    move_to_level_b,
+                },
+                table: TableInfo,
+            }, manifest_entries_max: {
+                // Worst-case manifest updates:
+                // See docs/internals/lsm.md "Compaction Table Overlap" for more detail.
+                var count = 0;
+
+                count += constants.lsm_growth_factor + 1; // Insert the output tables to level B.
+                // (In the move-table case, only a single TableInfo is inserted, and none are updated.)
+                break :manifest_entries_max count;
+            }) = .{},
         };
 
         const BeatContext = struct {
@@ -146,7 +165,6 @@ pub fn CompactionType(
             input_index_blocks: []BlockPtr,
             input_data_blocks: []BlockPtr,
 
-            output_index_blocks: []BlockPtr,
             output_data_blocks: []BlockPtr,
 
             grid_reads: []Grid.FatRead,
@@ -165,25 +183,7 @@ pub fn CompactionType(
 
         // Allocated during `init`.
         last_keys_in: [2]?Key = .{ null, null },
-
-        /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
-        /// they are applied deterministically relative to other concurrent compactions.
-        manifest_entries: stdx.BoundedArray(struct {
-            operation: enum {
-                insert_to_level_b,
-                move_to_level_b,
-            },
-            table: TableInfo,
-        }, manifest_entries_max: {
-            // Worst-case manifest updates:
-            // See docs/internals/lsm.md "Compaction Table Overlap" for more detail.
-            var count = 0;
-
-            // FIXME why is this +1?
-            count += constants.lsm_growth_factor + 1; // Insert the output tables to level B.
-            // (In the move-table case, only a single TableInfo is inserted, and none are updated.)
-            break :manifest_entries_max count;
-        }) = .{},
+        table_builder: Table.Builder = .{},
 
         // Populated by {bar,beat}_setup.
         bar_context: ?BarContext,
@@ -226,37 +226,25 @@ pub fn CompactionType(
                 .values_in = .{ &.{}, &.{} },
             };
 
-            // compaction.table_builder.reset();
+            // FIXME: Ensure blocks are released...
+            compaction.table_builder.reset();
         }
 
         /// Called per bar
         /// Perform the bar-wise setup, and return information that the forest can use for scheduling.
-        /// beat_target is the number of beats that this compaction will have available to do its work.
-        /// A compaction may be done before beat_target, if eg tables are mostly empty.
-        pub fn bar_setup(compaction: *Compaction, tree: *Tree, op: u64) ?void {
+        /// beat_budget is the number of beats that this compaction will have available to do its work.
+        /// A compaction may be done before beat_budget, if eg tables are mostly empty.
+        /// Output index blocks are special, and are allocated at a bar level unlike all the other blocks
+        /// which are done at a beat level. This is because while we can ensure we fill a data block, index
+        /// blocks are too infrequent (one per table) to divide compaction by.
+        /// Returns null if there's no compaction work, otherwise returns the compaction work that needs to be done.
+        /// move_table is a semi-special case - a non-null value is returned because we still need to do manifest
+        /// updates in bar_finish, but we don't need to actually _do_ anything else.
+        pub fn bar_setup(compaction: *Compaction, tree: *Tree, op: u64) ?CompactionInfo {
             assert(compaction.bar_context == null);
             assert(compaction.beat_context == null);
 
             std.log.info("bar_setup running for compaction: {s} into level: {}", .{ compaction.tree_config.name, compaction.level_b });
-
-            // FIXME: Double check what uses this much later
-            // FIXME: Init this in a better way :(
-            var bar_context: BarContext = .{
-                .tree = tree,
-                .op_min = op,
-
-                // These will be set later on... (:/)
-                .move_table = undefined,
-                .table_info_a = undefined,
-                .range_b = undefined,
-                .drop_tombstones = undefined,
-
-                .beat_target = null,
-                .beat_count = 0,
-            };
-
-            // BLAH hack. We return null but want to set this. What about our undefined fields?
-            compaction.bar_context = bar_context;
 
             // level_b 0 is special; unlike all the others which come from disk, level 0 comes
             // from the immutable table. This means that blip_read will effectively be a noop, and
@@ -264,7 +252,6 @@ pub fn CompactionType(
             // of that just yet.
             if (compaction.level_b == 0) {
                 // Do not start compaction if the immutable table does not require compaction.
-                // FIXME: How will returning null here work with our set .bar_context above...
                 if (tree.table_immutable.mutability.immutable.flushed) return null;
 
                 const values = tree.table_immutable.values_used();
@@ -291,9 +278,23 @@ pub fn CompactionType(
                     values_count,
                 });
 
-                bar_context.move_table = false;
-                bar_context.table_info_a = .{ .immutable = tree.table_immutable.values_used() };
-                bar_context.range_b = range_b;
+                compaction.bar_context = .{
+                    .tree = tree,
+                    .op_min = op,
+
+                    .move_table = false,
+                    .table_info_a = .{ .immutable = tree.table_immutable.values_used() },
+                    .range_b = range_b,
+                    .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
+                        compaction.level_b,
+                        range_b,
+                    ),
+
+                    // FIXME: Don't like this! How to do it better?
+                    .output_index_blocks = undefined,
+                    .beat_budget = null,
+                    .beat_count = 0,
+                };
             } else {
                 // Do not start compaction if level A does not require compaction.
                 const level_a = compaction.level_b - 1;
@@ -314,24 +315,57 @@ pub fn CompactionType(
                     compaction.level_b,
                 });
 
-                bar_context.move_table = range_b.tables.empty();
-                bar_context.table_info_a = .{ .disk = table_range.table_a };
-                bar_context.range_b = range_b;
-
-                if (bar_context.move_table) {
+                const perform_move_table = range_b.tables.empty();
+                if (perform_move_table) {
                     compaction.move_table();
                 }
+
+                compaction.bar_context = .{
+                    .tree = tree,
+                    .op_min = op,
+
+                    .move_table = perform_move_table,
+                    .table_info_a = .{ .disk = table_range.table_a },
+                    .range_b = range_b,
+                    .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
+                        compaction.level_b,
+                        range_b,
+                    ),
+
+                    // FIXME: Don't like this! How to do it better?
+                    .output_index_blocks = undefined,
+                    .beat_budget = null,
+                    .beat_count = 0,
+                };
             }
 
-            bar_context.drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
-                compaction.level_b,
-                bar_context.range_b,
-            );
-            assert(bar_context.drop_tombstones or compaction.level_b < constants.lsm_levels - 1);
+            assert(compaction.bar_context.?.drop_tombstones or compaction.level_b < constants.lsm_levels - 1);
 
-            compaction.bar_context = bar_context;
+            return .{
+                .table_info_a = compaction.bar_context.?.table_info_a,
+                .range_b = compaction.bar_context.?.range_b,
+            };
+        }
 
-            // FIXME: Return info on this compaction
+        /// Setup the per beat budget, as well as the output index block. Done in a separate step to bar_setup()
+        /// since the forest requires information from that step to calculate how it should split the work, and
+        /// if there's move table, output_index_blocks must be len 0.
+        // Minimum of 1, max lsm_growth_factor+1 of output_index_blocks.
+        pub fn bar_setup_budget(compaction: *Compaction, beat_budget: u64, output_index_blocks: []BlockPtr) void {
+            assert(compaction.bar_context != null);
+            assert(compaction.bar_context.?.beat_budget == null);
+            assert(compaction.beat_context == null);
+
+            if (compaction.bar_context.?.move_table) {
+                assert(output_index_blocks.len == 0);
+                assert(beat_budget == 0);
+            } else {
+                assert(output_index_blocks.len > 0);
+                assert(beat_budget > 0);
+            }
+
+            compaction.bar_context.?.beat_budget = beat_budget;
+            compaction.bar_context.?.output_index_blocks = output_index_blocks;
         }
 
         /// Called per beat
@@ -340,15 +374,12 @@ pub fn CompactionType(
             blocks: struct {
                 // Actually... All the comments below would be to do _all_ the work required. The max amount to do the work required
                 // per beat would then be divided by beat. _however_ the minimums won't change!
-                // One outstanding question is if we actually want to split things like this. We can use input blocks as output blocks
-                // once they've been exhausted..... Let's leave that as a future optimization since it won't change determinism.
                 // Minimum of 2, max lsm_growth_factor+1. Replaces index_block_a and index_block_b too.
+                // Output index blocks are explicitly handled in bar_setup_budget.
                 input_index_blocks: []BlockPtr,
                 // Minimum of 2, one from each table. Max would be max possible data blocks in lsm_growth_factor+1 tables.
                 input_data_blocks: []BlockPtr,
 
-                // Minimum of 1, max lsm_growth_factor+1
-                output_index_blocks: []BlockPtr,
                 // Minimum of 1, max would be max possible data blocks in lsm_growth_factor+1 tables.
                 output_data_blocks: []BlockPtr,
 
@@ -360,8 +391,8 @@ pub fn CompactionType(
             assert(compaction.beat_context == null);
 
             const bar_context = compaction.bar_context.?;
-            assert(bar_context.beat_target != null);
-            const beat_target = bar_context.beat_target.?;
+            assert(bar_context.beat_budget != null and bar_context.beat_budget.? > 0);
+            const beat_budget = bar_context.beat_budget.?;
 
             // We don't need to assert the maximums, wasted memory, sure, but entirely possible and
             // not harmful.
@@ -369,19 +400,16 @@ pub fn CompactionType(
             assert(blocks.input_data_blocks.len >= 2);
             assert(blocks.input_index_blocks.len + blocks.input_data_blocks.len == blocks.grid_reads.len);
 
-            assert(blocks.output_index_blocks.len >= 1);
             assert(blocks.output_data_blocks.len >= 1);
-            assert(blocks.output_index_blocks.len + blocks.output_data_blocks.len == blocks.grid_writes.len);
+            assert(bar_context.output_index_blocks.len + blocks.output_data_blocks.len == blocks.grid_writes.len);
 
-            // FIXME: We could also assert not this, and make it the calling code's problem?
-            if (bar_context.move_table) {
-                return;
-            }
+            // If we're move_table, the calling code should ensure beat_setup and blip code are never called.
+            assert(!bar_context.move_table);
 
-            // Reserve enough blocks to write our output tables in the worst case, where:
+            // Reserve enough blocks to write our output tables in the semi-worst case, where:
             // - no tombstones are dropped,
             // - no values are overwritten,
-            // - and all tables are full.
+            // - and we know exact input value counts, so table fullness *is* accounted for.
             //
             // We must reserve before doing any async work so that the block acquisition order
             // is deterministic (relative to other concurrent compactions).
@@ -391,10 +419,11 @@ pub fn CompactionType(
             // regardless of how many beats we're targeting. We should only divide data blocks?
 
             // +1 to count the input table from level A.
+            // FIXME: Actually take in to account value count from ranges and info.
             const grid_blocks_whole_bar = (bar_context.range_b.tables.count() + 1) * Table.block_count_max;
-            const grid_blocks_per_beat = stdx.div_ceil(grid_blocks_whole_bar, beat_target);
+            const grid_blocks_per_beat = stdx.div_ceil(grid_blocks_whole_bar, beat_budget);
 
-            // FIXME The replica must stop accepting requests if it runs out of blocks/capacity,
+            // TODO The replica must stop accepting requests if it runs out of blocks/capacity,
             // rather than panicking here.
             // (actually, we want to still panic but with something nicer like vsr.fail)
             const grid_reservation = compaction.grid.reserve(grid_blocks_per_beat).?;
@@ -404,13 +433,10 @@ pub fn CompactionType(
 
                 .input_index_blocks = blocks.input_index_blocks,
                 .input_data_blocks = blocks.input_data_blocks,
-                .output_index_blocks = blocks.output_index_blocks,
                 .output_data_blocks = blocks.output_data_blocks,
                 .grid_reads = blocks.grid_reads,
                 .grid_writes = blocks.grid_writes,
             };
-
-            // assert(grid_reservation or bar_context.move_table);
         }
 
         /// Perform read IO to fill our input_index_blocks and input_data_blocks with as many blocks
@@ -477,7 +503,7 @@ pub fn CompactionType(
             // );
         }
 
-        fn blip_read_index_callback(read: *Grid.Read, block: Grid.BlockPtrConst) void {
+        fn blip_read_index_callback(read: *Grid.Read, block: BlockPtrConst) void {
             const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", read).target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
@@ -499,7 +525,7 @@ pub fn CompactionType(
             _ = compaction;
         }
 
-        fn blip_read_data_callback(read: *Grid.Read, block: Grid.BlockPtrConst) void {
+        fn blip_read_data_callback(read: *Grid.Read, block: BlockPtrConst) void {
             const compaction: *Compaction = @alignCast(@ptrCast(@fieldParentPtr(Grid.FatRead, "read", read).target));
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
@@ -586,8 +612,8 @@ pub fn CompactionType(
             assert(compaction.beat_context == null);
             assert(compaction.bar_context != null);
 
-            const bar_context = compaction.bar_context.?;
-            assert(bar_context.beat_count >= bar_context.beat_target.?);
+            const bar_context = &compaction.bar_context.?;
+            assert(bar_context.beat_count >= bar_context.beat_budget.?);
 
             // BLAAAH deal with this better!
             if (compaction.bar_context == null) {
@@ -618,7 +644,7 @@ pub fn CompactionType(
                 }
             }
 
-            for (compaction.manifest_entries.slice()) |*entry| {
+            for (bar_context.manifest_entries.slice()) |*entry| {
                 switch (entry.operation) {
                     .insert_to_level_b => manifest.insert_table(level_b, &entry.table),
                     .move_to_level_b => manifest.move_table(level_b - 1, level_b, &entry.table),
@@ -633,7 +659,7 @@ pub fn CompactionType(
         // FIXME: For now, move_table will happen in the prepare step, but we still have to pulse
         // through the (useless) read / merge / write steps before finalizing it.
         fn move_table(compaction: *Compaction) void {
-            const bar_context = compaction.bar_context.?;
+            const bar_context = &compaction.bar_context.?;
 
             log.info(
                 "{s}: Moving table: level_b={}",
@@ -644,7 +670,7 @@ pub fn CompactionType(
             const table_a = bar_context.table_info_a.disk.table_info;
             assert(table_a.snapshot_max >= snapshot_max);
 
-            compaction.manifest_entries.append_assume_capacity(.{
+            bar_context.manifest_entries.append_assume_capacity(.{
                 .operation = .move_to_level_b,
                 .table = table_a.*,
             });
@@ -811,9 +837,11 @@ pub fn CompactionType(
             return target_count;
         }
 
-        fn on_index_block(iterator_b: *LevelTableValueBlockIterator) void {
+        fn on_index_block(iterator_b: void) void {
             const compaction = @fieldParentPtr(Compaction, "iterator_b", iterator_b);
             assert(std.meta.eql(compaction.state, .{ .iterator_next = .b }));
+
+            // This is super NB:
             compaction.release_table_blocks(compaction.index_block_b);
         }
 
@@ -832,7 +860,7 @@ pub fn CompactionType(
         }
 
         fn iterator_next_a(
-            iterator_a: *TableDataIterator,
+            iterator_a: void,
             data_block: ?BlockPtrConst,
         ) void {
             const compaction = @fieldParentPtr(Compaction, "iterator_a", iterator_a);
@@ -841,7 +869,7 @@ pub fn CompactionType(
         }
 
         fn iterator_next_b(
-            iterator_b: *LevelTableValueBlockIterator,
+            iterator_b: void,
             data_block: ?BlockPtrConst,
         ) void {
             const compaction = @fieldParentPtr(Compaction, "iterator_b", iterator_b);
