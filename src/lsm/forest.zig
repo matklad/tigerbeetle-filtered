@@ -11,6 +11,7 @@ const vsr = @import("../vsr.zig");
 
 const schema = @import("schema.zig");
 const GridType = @import("../vsr/grid.zig").GridType;
+const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
 const table_count_max = @import("tree.zig").table_count_max;
@@ -176,6 +177,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         node_pool: *NodePool,
         manifest_log: ManifestLog,
         manifest_log_progress: enum { idle, compacting, done, skip } = .idle,
+        compaction_blocks: []Grid.BlockPtr,
+        compaction_reads: []Grid.FatRead,
+        compaction_writes: []Grid.FatWrite,
 
         pub fn init(
             allocator: mem.Allocator,
@@ -219,11 +223,30 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 grooves_initialized += 1;
             }
 
+            const compaction_blocks = try allocator.alloc(Grid.BlockPtr, 1024);
+            errdefer allocator.free(compaction_blocks);
+
+            for (compaction_blocks, 0..) |*cache_block, i| {
+                errdefer for (compaction_blocks[0..i]) |block| allocator.free(block);
+                cache_block.* = try allocate_block(allocator);
+            }
+            errdefer for (compaction_blocks) |block| allocator.free(block);
+
+            const compaction_reads = try allocator.alloc(Grid.FatRead, 1024);
+            errdefer allocator.free(compaction_reads);
+
+            const compaction_writes = try allocator.alloc(Grid.FatWrite, 1024);
+            errdefer allocator.free(compaction_writes);
+
             return Forest{
                 .grid = grid,
                 .grooves = grooves,
                 .node_pool = node_pool,
                 .manifest_log = manifest_log,
+
+                .compaction_blocks = compaction_blocks,
+                .compaction_reads = compaction_reads,
+                .compaction_writes = compaction_writes,
             };
         }
 
@@ -235,6 +258,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             forest.manifest_log.deinit(allocator);
             forest.node_pool.deinit(allocator);
             allocator.destroy(forest.node_pool);
+
+            // FIXME: Deinit compaction_blocks
         }
 
         pub fn reset(forest: *Forest) void {
@@ -251,6 +276,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 .grooves = forest.grooves,
                 .node_pool = forest.node_pool,
                 .manifest_log = forest.manifest_log,
+
+                .compaction_blocks = forest.compaction_blocks,
+                .compaction_reads = forest.compaction_reads,
+                .compaction_writes = forest.compaction_writes,
             };
         }
 
@@ -306,28 +335,123 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         }
 
         pub fn compact(forest: *Forest, callback: Callback, op: u64) void {
-            assert(forest.progress == null);
-            forest.verify_table_extents();
+            const compaction_beat = op % constants.lsm_batch_multiple;
 
+            // Note: The first beat of the first bar is a special case. It has op 1, and so
+            // no bar_setup is called. bar_finish compensates for this internally currently.
+            const first_beat = compaction_beat == 0;
+            const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
+
+            // "Setup" loop
+            inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                var tree = tree_for_id(forest, tree_id);
+                // FIXME: Remember to remove me slice
+                for (tree.compactions[0..1], 0..) |*compaction, i| {
+                    std.log.info("Tree: {s}@{}; compaction into level: {}", .{ tree.config.name, op, i });
+
+                    // This will return how many compactions and stuff this level needs to do...
+                    if (first_beat) {
+                        const work = compaction.bar_setup(tree, op);
+                        _ = work;
+
+                        // FIXME: Make method
+                        compaction.bar_context.?.beat_target = 32;
+                    }
+
+                    if (op > constants.lsm_batch_multiple) {
+                        // Then we'll set up the beat depending on what buffers we have available.
+                        _ = compaction.beat_setup(.{
+                            .input_index_blocks = forest.compaction_blocks[0..16],
+                            .input_data_blocks = forest.compaction_blocks[16..32],
+                            .output_index_blocks = forest.compaction_blocks[32..48],
+                            .output_data_blocks = forest.compaction_blocks[48..64],
+                            .grid_reads = forest.compaction_reads[0..32],
+                            .grid_writes = forest.compaction_writes[0..32],
+                        });
+                        compaction.blip_read();
+                    }
+                }
+            }
+
+            // "Finish" loop
+            inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                var tree = tree_for_id(forest, tree_id);
+                // FIXME: Remember to remove me slice
+                for (tree.compactions[0..1], 0..) |*compaction, i| {
+                    _ = i;
+                    if (op > constants.lsm_batch_multiple) {
+                        compaction.beat_finish();
+                    }
+
+                    // FIXME: Control flow here is super messy ATM. Want to split out the < batch multiple stuff.
+                    if (last_beat) {
+                        compaction.bar_finish(op, tree);
+                    }
+                }
+            }
+
+            // Groove sync compaction...
             inline for (std.meta.fields(Grooves)) |field| {
-                @field(forest.grooves, field.name).compact(compact_groove_callback(field.name), op);
+                @field(forest.grooves, field.name).compact(op);
             }
 
             if (op % @divExact(constants.lsm_batch_multiple, 2) == 0) {
                 assert(forest.manifest_log_progress == .idle);
 
                 forest.manifest_log_progress = .compacting;
-                forest.manifest_log.compact(compact_manifest_log_callback, op);
+                // FIXME - manifest log reservation needs to be brought in with the above somehow
+                // forest.manifest_log.compact(compact_manifest_log_callback, op);
             } else {
                 if (op == 1) {
                     assert(forest.manifest_log_progress == .idle);
                     forest.manifest_log_progress = .skip;
                 } else {
                     assert(forest.manifest_log_progress != .idle);
+                    // FIXME manifest hack
+                    forest.manifest_log_progress = .skip;
                 }
             }
 
-            forest.progress = .{ .compact = .{ .op = op, .callback = callback } };
+            forest.progress = .{ .compact = .{
+                .op = op,
+                .callback = callback,
+                .pending = GroovesBitSet.initEmpty(),
+            } };
+            forest.compact_callback();
+        }
+
+        // FIXME: This mixes both manifest and non-manifest compaction
+        fn compact_callback(forest: *Forest) void {
+            assert(forest.progress.? == .compact);
+            assert(forest.manifest_log_progress != .idle);
+            forest.verify_table_extents();
+
+            const progress = &forest.progress.?.compact;
+            if (progress.pending.count() > 0) return;
+
+            const half_bar_end =
+                (progress.op + 1) % @divExact(constants.lsm_batch_multiple, 2) == 0;
+            // On the last beat of the bar, make sure that manifest log compaction is finished.
+            if (half_bar_end and forest.manifest_log_progress == .compacting) return;
+
+            // FIXME
+            // inline for (std.meta.fields(Grooves)) |field| {
+            //     @field(forest.grooves, field.name).compact_end();
+            // }
+
+            if (half_bar_end) {
+                switch (forest.manifest_log_progress) {
+                    .idle => unreachable,
+                    .compacting => unreachable,
+                    .done => forest.manifest_log.compact_end(),
+                    .skip => {},
+                }
+                forest.manifest_log_progress = .idle;
+            }
+
+            const callback = progress.callback;
+            forest.progress = null;
+            callback(forest);
         }
 
         fn compact_manifest_log_callback(manifest_log: *ManifestLog) void {
@@ -343,64 +467,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             } else {
                 // The manifest log compaction completed between compaction beats.
             }
-        }
-
-        fn compact_groove_callback(
-            comptime groove_field_name: []const u8,
-        ) *const fn (*GrooveFor(groove_field_name)) void {
-            return struct {
-                fn groove_callback(groove: *GrooveFor(groove_field_name)) void {
-                    const grooves: *align(@alignOf(Grooves)) Grooves =
-                        @alignCast(@fieldParentPtr(Grooves, groove_field_name, groove));
-                    const forest = @fieldParentPtr(Forest, "grooves", grooves);
-
-                    const groove_index = comptime groove_index: {
-                        for (std.meta.fields(Grooves), 0..) |groove_field, i| {
-                            if (std.mem.eql(u8, groove_field.name, groove_field_name)) {
-                                break :groove_index i;
-                            }
-                        }
-                        unreachable;
-                    };
-
-                    assert(forest.progress.?.compact.pending.isSet(groove_index));
-                    forest.progress.?.compact.pending.unset(groove_index);
-
-                    forest.compact_callback();
-                }
-            }.groove_callback;
-        }
-
-        fn compact_callback(forest: *Forest) void {
-            assert(forest.progress.? == .compact);
-            assert(forest.manifest_log_progress != .idle);
-            forest.verify_table_extents();
-
-            const progress = &forest.progress.?.compact;
-            if (progress.pending.count() > 0) return;
-
-            const half_bar_end =
-                (progress.op + 1) % @divExact(constants.lsm_batch_multiple, 2) == 0;
-            // On the last beat of the bar, make sure that manifest log compaction is finished.
-            if (half_bar_end and forest.manifest_log_progress == .compacting) return;
-
-            inline for (std.meta.fields(Grooves)) |field| {
-                @field(forest.grooves, field.name).compact_end();
-            }
-
-            if (half_bar_end) {
-                switch (forest.manifest_log_progress) {
-                    .idle => unreachable,
-                    .compacting => unreachable,
-                    .done => forest.manifest_log.compact_end(),
-                    .skip => {},
-                }
-                forest.manifest_log_progress = .idle;
-            }
-
-            const callback = progress.callback;
-            forest.progress = null;
-            callback(forest);
         }
 
         fn GrooveFor(comptime groove_field_name: []const u8) type {

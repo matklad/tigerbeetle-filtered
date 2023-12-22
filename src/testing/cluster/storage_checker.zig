@@ -3,7 +3,7 @@
 //! At each replica compact and checkpoint, check that storage is byte-for-byte identical across
 //! replicas.
 //!
-//! Areas verified at compaction (half-measure):
+//! Areas verified at compaction (half-bar):
 //! - Acquired Grid blocks (ignores skipped recovery compactions)
 //!  TODO Because ManifestLog acquires blocks potentially several beats prior to actually writing
 //!  the block, this check will need to be removed or use a different strategy.
@@ -31,10 +31,11 @@ const vsr = @import("../../vsr.zig");
 const schema = @import("../../lsm/schema.zig");
 const Storage = @import("../storage.zig").Storage;
 
-/// After each compaction half measure, save the cumulative hash of all acquired grid blocks.
+/// After each compaction half bar, save the cumulative hash of all acquired grid blocks.
 ///
-/// (Track half-measures instead of beats because the on-disk state mid-compaction is
+/// (Track half-bars instead of beats because the on-disk state mid-compaction is
 /// nondeterministic; it depends on IO progress.)
+/// TODO: This will be deterministic across beats now.
 const Compactions = std.ArrayList(u128);
 
 /// Maps from op_checkpoint to cumulative storage checksum.

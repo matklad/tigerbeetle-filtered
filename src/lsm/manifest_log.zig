@@ -1140,11 +1140,13 @@ const Pace = struct {
 
         const block_entries_max = schema.ManifestNode.entry_count_max;
 
-        const half_bar_append_entries_max = options.tree_count *
-            tree.compactions_max *
-            (tree.compaction_tables_input_max + // Update snapshot_max.
-            tree.compaction_tables_input_max + // Remove.
-            tree.compaction_tables_output_max); // Insert.
+        // TODO!!!!!
+        const half_bar_append_entries_max = options.tree_count * 8 * 9 * 3;
+        // const half_bar_append_entries_max = options.tree_count *
+        //     tree.compactions_max *
+        //     (tree.compaction_tables_input_max + // Update snapshot_max.
+        //     tree.compaction_tables_input_max + // Remove.
+        //     tree.compaction_tables_output_max); // Insert.
 
         // "A":
         const half_bar_append_blocks_max =

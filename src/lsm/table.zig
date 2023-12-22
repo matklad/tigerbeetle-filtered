@@ -247,23 +247,16 @@ pub fn TableType(
             data_block_count: u32 = 0,
             value_count: u32 = 0,
 
-            pub fn init(allocator: mem.Allocator) !Builder {
-                const index_block = try allocate_block(allocator);
-                errdefer allocator.free(index_block);
-
-                const data_block = try allocate_block(allocator);
-                errdefer allocator.free(data_block);
-
+            // TODO: data_block should be data_blocks, so we can pass down multiple blocks
+            // here
+            pub fn init(index_block: BlockPtr, data_block: BlockPtr) !Builder {
                 return Builder{
                     .index_block = index_block,
                     .data_block = data_block,
                 };
             }
 
-            pub fn deinit(builder: *Builder, allocator: mem.Allocator) void {
-                allocator.free(builder.index_block);
-                allocator.free(builder.data_block);
-
+            pub fn deinit(builder: *Builder) void {
                 builder.* = undefined;
             }
 
