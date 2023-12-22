@@ -697,14 +697,23 @@ test "Cluster: repair: ack committed prepare" {
     try expectEqual(b1.op_head(), 21);
     try expectEqual(b2.op_head(), 20);
 
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
+
     // Change views. B1/B2 participate. Don't allow B2 to repair op=21.
     t.replica(.R_).pass(.R_, .bidirectional, .start_view_change);
     t.replica(.R_).pass(.R_, .bidirectional, .do_view_change);
     p.drop(.__, .bidirectional, .prepare);
     p.drop(.__, .bidirectional, .do_view_change);
+    p.drop(.__, .bidirectional, .start_view_change);
     t.run();
     try expectEqual(b1.commit(), 20);
     try expectEqual(b2.commit(), 20);
+
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
 
     // But other than that, heal A0/B1, but partition B2 completely.
     // (Prevent another view change.)
@@ -715,8 +724,14 @@ test "Cluster: repair: ack committed prepare" {
     t.replica(.R_).drop(.R_, .bidirectional, .do_view_change);
     t.run();
 
+    try expectEqual(p.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
+
     // A0 acks op=21 even though it already committed it.
+    try expectEqual(p.commit(), 21);
     try expectEqual(b1.commit(), 21);
+    try expectEqual(b2.commit(), 20);
 }
 
 test "Cluster: repair: primary checkpoint, backup crash before checkpoint, primary prepare" {
@@ -866,23 +881,23 @@ test "Cluster: sync: sync, bump target, sync" {
     defer t.deinit();
 
     var c = t.clients(0, t.cluster.clients.len);
-    try c.request(20, 20);
-    try expectEqual(t.replica(.R_).commit(), 20);
+    try c.request(16, 16);
+    try expectEqual(t.replica(.R_).commit(), 16);
 
     t.replica(.R2).drop_all(.R_, .bidirectional);
     try c.request(checkpoint_2_trigger, checkpoint_2_trigger);
 
-    // Allow R2 to complete SyncStage.requesting_trailers, but get stuck
-    // during SyncStage.requesting_trailers.
+    // Allow R2 to complete SyncStage.requesting_target, but get stuck
+    // during SyncStage.requesting_checkpoint.
     t.replica(.R2).pass_all(.R_, .bidirectional);
     t.replica(.R2).drop(.R_, .outgoing, .request_sync_checkpoint);
     t.run();
-    try expectEqual(t.replica(.R2).sync_status(), .requesting_trailers);
+    try expectEqual(t.replica(.R2).sync_status(), .requesting_checkpoint);
     try expectEqual(t.replica(.R2).sync_target_checkpoint_op(), checkpoint_2);
 
     // R2 discovers the newer sync target and restarts sync.
     try c.request(checkpoint_3_trigger, checkpoint_3_trigger);
-    try expectEqual(t.replica(.R2).sync_status(), .requesting_trailers);
+    try expectEqual(t.replica(.R2).sync_status(), .requesting_checkpoint);
     try expectEqual(t.replica(.R2).sync_target_checkpoint_op(), checkpoint_3);
 
     t.replica(.R2).pass(.R_, .bidirectional, .request_sync_checkpoint);
@@ -974,7 +989,7 @@ test "Cluster: sync: checkpoint diverges, sync (primary diverges)" {
 
     // A0 has learned about B1/B2's canonical checkpoint — a checkpoint with the same op,
     // but a different identifier.
-    try expectEqual(a0.sync_status(), .requesting_trailers);
+    try expectEqual(a0.sync_status(), .requesting_checkpoint);
     try expectEqual(a0.sync_target_checkpoint_op(), checkpoint_2);
     try expectEqual(a0.sync_target_checkpoint_op(), t.replica(.R_).op_checkpoint());
     try expectEqual(a0.sync_target_checkpoint_id(), b1.op_checkpoint_id());
@@ -1072,7 +1087,7 @@ const TestContext = struct {
             .replica_count = options.replica_count,
             .standby_count = options.standby_count,
             .client_count = options.client_count,
-            .storage_size_limit = vsr.sector_floor(constants.storage_size_max),
+            .storage_size_limit = vsr.sector_floor(constants.storage_size_limit_max),
             .seed = random.int(u64),
             .network = .{
                 .node_count = options.replica_count + options.standby_count,

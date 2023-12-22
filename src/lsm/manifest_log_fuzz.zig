@@ -86,7 +86,7 @@ fn run_fuzz(
         env.open_superblock();
         env.wait(&env.manifest_log);
 
-        env.open_free_set();
+        env.open_grid();
         env.wait(&env.manifest_log);
 
         env.open();
@@ -196,6 +196,7 @@ fn generate_events(
                     .snapshot_max = std.math.maxInt(u64),
                     .key_min = .{0} ** 16,
                     .key_max = .{0} ** 16,
+                    .value_count = 1,
                     .tree_id = 1,
                     .label = .{
                         .event = .insert,
@@ -257,8 +258,6 @@ fn generate_events(
 }
 
 const Environment = struct {
-    const FreeSetEncoded = vsr.FreeSetEncodedType(Storage);
-
     allocator: std.mem.Allocator,
     storage: Storage,
     storage_verify: Storage,
@@ -287,25 +286,25 @@ const Environment = struct {
 
         fields_initialized += 1;
         env.storage =
-            try Storage.init(allocator, constants.storage_size_max, storage_options);
+            try Storage.init(allocator, constants.storage_size_limit_max, storage_options);
         errdefer env.storage.deinit(allocator);
 
         fields_initialized += 1;
         env.storage_verify =
-            try Storage.init(allocator, constants.storage_size_max, storage_options);
+            try Storage.init(allocator, constants.storage_size_limit_max, storage_options);
         errdefer env.storage_verify.deinit(allocator);
 
         fields_initialized += 1;
         env.superblock = try SuperBlock.init(allocator, .{
             .storage = &env.storage,
-            .storage_size_limit = constants.storage_size_max,
+            .storage_size_limit = constants.storage_size_limit_max,
         });
         errdefer env.superblock.deinit(allocator);
 
         fields_initialized += 1;
         env.superblock_verify = try SuperBlock.init(allocator, .{
             .storage = &env.storage_verify,
-            .storage_size_limit = constants.storage_size_max,
+            .storage_size_limit = constants.storage_size_limit_max,
         });
         errdefer env.superblock_verify.deinit(allocator);
 
@@ -395,18 +394,13 @@ const Environment = struct {
         env.pending -= 1;
     }
 
-    fn open_free_set(env: *Environment) void {
+    fn open_grid(env: *Environment) void {
         assert(env.pending == 0);
         env.pending += 1;
-        env.grid.free_set_encoded.open(
-            &env.grid,
-            env.superblock.working.free_set_reference(),
-            open_free_set_callback,
-        );
+        env.grid.open(open_grid_callback);
     }
 
-    fn open_free_set_callback(free_set_encoded: *FreeSetEncoded) void {
-        const grid = @fieldParentPtr(Grid, "free_set_encoded", free_set_encoded);
+    fn open_grid_callback(grid: *Grid) void {
         const env = @fieldParentPtr(Environment, "grid", grid);
         env.pending -= 1;
     }
@@ -471,34 +465,26 @@ const Environment = struct {
 
         const vsr_state = &env.manifest_log.superblock.working.vsr_state;
 
-        {
-            // VSRState.monotonic() asserts that the previous_checkpoint id changes.
-            // In a normal replica this is guaranteed – even if the LSM is idle and no blocks
-            // are acquired or released, the client sessions are necessarily mutated.
-            var reply = std.mem.zeroInit(vsr.Header.Reply, .{
-                .cluster = 0,
-                .command = .reply,
-                .op = vsr_state.checkpoint.commit_min + 1,
-                .commit = vsr_state.checkpoint.commit_min + 1,
-            });
-            reply.set_checksum_body(&.{});
-            reply.set_checksum();
-
-            _ = env.manifest_log.superblock.client_sessions.put(1, &reply);
-        }
-
         env.pending += 1;
         env.manifest_log.superblock.checkpoint(
             checkpoint_superblock_callback,
             &env.superblock_context,
             .{
                 .manifest_references = env.manifest_log.checkpoint_references(),
-                .free_set_reference = env.grid.free_set_encoded.checkpoint_reference(),
+                .free_set_reference = env.grid.free_set_checkpoint.checkpoint_reference(),
+                .client_sessions_reference = .{
+                    .last_block_checksum = 0,
+                    .last_block_address = 0,
+                    .trailer_size = 0,
+                    .checksum = vsr.checksum(&.{}),
+                },
                 .commit_min_checksum = vsr_state.checkpoint.commit_min_checksum + 1,
                 .commit_min = vsr.Checkpoint.checkpoint_after(vsr_state.checkpoint.commit_min),
                 .commit_max = vsr.Checkpoint.checkpoint_after(vsr_state.commit_max),
                 .sync_op_min = 0,
                 .sync_op_max = 0,
+                .storage_size = vsr.superblock.data_file_size_min +
+                    (env.grid.free_set.highest_address_acquired() orelse 0) * constants.block_size,
             },
         );
         env.wait(&env.manifest_log);
@@ -540,7 +526,7 @@ const Environment = struct {
                 env.allocator,
                 .{
                     .storage = test_storage,
-                    .storage_size_limit = constants.storage_size_max,
+                    .storage_size_limit = constants.storage_size_limit_max,
                 },
             );
 

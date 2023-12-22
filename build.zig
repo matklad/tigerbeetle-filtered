@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) !void {
         }
     } else @panic("error: unsupported target");
 
-    const mode = b.standardOptimizeOption(.{});
+    const mode = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
     const emit_llvm_ir = b.option(bool, "emit-llvm-ir", "Emit LLVM IR (.ll file)") orelse false;
 
     const options = b.addOptions();
@@ -61,7 +61,13 @@ pub fn build(b: *std.Build) !void {
     defer shell.destroy();
 
     // The "tigerbeetle version" command includes the build-time commit hash.
-    options.addOption([]const u8, "git_commit", try shell.git_commit());
+    const git_commit = b.option(
+        []const u8,
+        "git-commit",
+        "The git commit revision of the source code.",
+    ) orelse try shell.git_commit();
+    options.addOption([]const u8, "git_commit", git_commit);
+
     options.addOption(
         []const u8,
         "version",
@@ -161,6 +167,13 @@ pub fn build(b: *std.Build) !void {
         benchmark.addModule("vsr", vsr_module);
         benchmark.addModule("vsr_options", vsr_options_module);
         link_tracer_backend(benchmark, git_clone_tracy, tracer_backend, target);
+
+        const install_step = b.addInstallArtifact(benchmark, .{});
+        const build_step = b.step(
+            "build_benchmark",
+            "Build TigerBeetle benchmark",
+        );
+        build_step.dependOn(&install_step.step);
 
         const run_cmd = b.addRunArtifact(benchmark);
         if (b.args) |args| run_cmd.addArgs(args);

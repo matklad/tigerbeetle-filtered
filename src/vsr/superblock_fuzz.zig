@@ -80,13 +80,13 @@ fn run_fuzz(allocator: std.mem.Allocator, seed: u64, transitions_count_total: us
 
     var superblock = try SuperBlock.init(allocator, .{
         .storage = &storage,
-        .storage_size_limit = constants.storage_size_max,
+        .storage_size_limit = constants.storage_size_limit_max,
     });
     defer superblock.deinit(allocator);
 
     var superblock_verify = try SuperBlock.init(allocator, .{
         .storage = &storage_verify,
-        .storage_size_limit = constants.storage_size_max,
+        .storage_size_limit = constants.storage_size_limit_max,
     });
     defer superblock_verify.deinit(allocator);
 
@@ -107,6 +107,10 @@ fn run_fuzz(allocator: std.mem.Allocator, seed: u64, transitions_count_total: us
                 .free_set_last_block_checksum = 0,
                 .free_set_last_block_address = 0,
                 .free_set_size = 0,
+                .client_sessions_checksum = vsr.checksum(&.{}),
+                .client_sessions_last_block_checksum = 0,
+                .client_sessions_last_block_address = 0,
+                .client_sessions_size = 0,
                 .manifest_oldest_checksum = 0,
                 .manifest_oldest_address = 0,
                 .manifest_newest_checksum = 0,
@@ -229,7 +233,6 @@ const Environment = struct {
         // faults for pending writes) and clear the read/write queues.
         env.superblock_verify.storage.copy(env.superblock.storage);
         env.superblock_verify.storage.reset();
-        env.superblock_verify.client_sessions.reset();
         env.superblock_verify.open(verify_callback, &env.context_verify);
 
         env.pending_verify = true;
@@ -391,6 +394,10 @@ const Environment = struct {
                 .free_set_last_block_checksum = 0,
                 .free_set_last_block_address = 0,
                 .free_set_size = 0,
+                .client_sessions_checksum = vsr.checksum(&.{}),
+                .client_sessions_last_block_checksum = 0,
+                .client_sessions_last_block_address = 0,
+                .client_sessions_size = 0,
                 .manifest_oldest_checksum = 0,
                 .manifest_newest_checksum = 0,
                 .manifest_oldest_address = 0,
@@ -410,20 +417,6 @@ const Environment = struct {
             .members = env.members,
             .replica_count = replica_count,
         };
-
-        // To mimic the replica, ClientSessions mutates between every checkpoint.
-        // This ensures that sequential checkpoint ids are never identical.
-        const session: u64 = 1;
-        var reply = std.mem.zeroInit(vsr.Header.Reply, .{
-            .cluster = cluster,
-            .command = .reply,
-            .client = 456,
-            .commit = vsr_state.checkpoint.commit_min,
-        });
-        reply.set_checksum_body(&.{});
-        reply.set_checksum();
-
-        _ = env.superblock.client_sessions.put(session, &reply);
 
         assert(env.sequence_states.items.len == env.superblock.staging.sequence + 1);
         try env.sequence_states.append(.{
@@ -445,8 +438,13 @@ const Environment = struct {
             .free_set_reference = .{
                 .last_block_checksum = 0,
                 .last_block_address = 0,
-                .free_set_size = 0,
-                .storage_size = data_file_size_min,
+                .trailer_size = 0,
+                .checksum = vsr.checksum(&.{}),
+            },
+            .client_sessions_reference = .{
+                .last_block_checksum = 0,
+                .last_block_address = 0,
+                .trailer_size = 0,
                 .checksum = vsr.checksum(&.{}),
             },
             .commit_min_checksum = vsr_state.checkpoint.commit_min_checksum,
@@ -454,6 +452,7 @@ const Environment = struct {
             .commit_max = vsr_state.commit_max,
             .sync_op_min = 0,
             .sync_op_max = 0,
+            .storage_size = data_file_size_min,
         });
     }
 

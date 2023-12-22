@@ -2,6 +2,7 @@ const std = @import("std");
 const stdx = @import("./stdx.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const maybe = stdx.maybe;
 const mem = std.mem;
 
 const tb = @import("tigerbeetle.zig");
@@ -97,7 +98,7 @@ pub fn main() !void {
         .standby_count = standby_count,
         .client_count = client_count,
         .storage_size_limit = vsr.sector_floor(
-            constants.storage_size_max - random.uintLessThan(u64, constants.storage_size_max / 10),
+            constants.storage_size_limit_max - random.uintLessThan(u64, constants.storage_size_limit_max / 10),
         ),
         .seed = random.int(u64),
         .network = .{
@@ -414,7 +415,13 @@ pub const Simulator = struct {
         // Check whether the replica is still repairing prepares/tables/replies.
         for (simulator.cluster.replicas) |*replica| {
             if (simulator.core.isSet(replica.replica)) {
-                if (replica.journal.faulty.count > 0) return false;
+                for (replica.op_checkpoint() + 1..replica.op + 1) |op| {
+                    const header = replica.journal.header_with_op(op).?;
+                    if (!replica.journal.has_clean(header)) return false;
+                }
+                // It's okay for a replica to miss some prepares older than the current checkpoint.
+                maybe(replica.journal.faulty.count > 0);
+
                 if (!replica.sync_content_done()) return false;
             }
         }
@@ -632,30 +639,50 @@ pub const Simulator = struct {
         }
     }
 
-    // Check if the core is stuck in a view change because replicas can't converge to a canonical
-    // checkpoint. This can happen in two scenarios:
+    // Check if the core is stuck because replicas can't converge to a canonical checkpoint. This
+    // can happen in two scenarios:
     //
-    // - There is a canonical checkpoint, but replicas can't learn about because commit messages
-    //   don't flow during view change.
-    // - There is no canonical checkpoint at all --- one replica is ahead of others by a checkpoint,
-    //   but there are no commits on top of that checkpoint.
+    // A) There is no canonical checkpoint at all --- one replica is ahead of others by a
+    //    checkpoint, but there are no commits on top of that checkpoint.
+    // B) During view change, there is a canonical checkpoint, but replicas can't learn that it is
+    //    in fact canonical, because commit messages don't flow, so commit_max is not advanced,
+    //    and there are not enough replicas at a checkpoint for the quorum condition.
     //
     // TODO: both of the above genuine liveness issues to be fixed with async checkpoints, which
     // would allow to sync to the _previous_ checkpoint, guaranteed to be canonical.
     fn core_missing_checkpoint(simulator: *const Simulator) bool {
+        var core_replicas_total: u8 = 0;
+        var core_replicas_normal: u8 = 0;
+        var commit_max: u64 = 0;
+        var checkpoint_max: u64 = 0;
         var core_checkpoints = stdx.BoundedArray(u128, constants.replicas_max){};
         for (simulator.cluster.replicas) |replica| {
             if (!simulator.core.isSet(replica.replica)) continue;
             if (replica.standby()) continue;
-
-            if (replica.status == .normal) return false;
+            core_replicas_total += 1;
+            core_replicas_normal += @intFromBool(replica.status == .normal);
+            commit_max = @max(commit_max, replica.commit_max);
+            checkpoint_max = @max(
+                checkpoint_max,
+                replica.superblock.working.vsr_state.checkpoint.commit_min,
+            );
             core_checkpoints.append_assume_capacity(replica.superblock.working.checkpoint_id());
         }
+
+        assert(core_replicas_normal == core_replicas_total or core_replicas_normal == 0);
 
         for (0..core_checkpoints.count()) |i| {
             for (0..i) |j| {
                 if (core_checkpoints.get(i) != core_checkpoints.get(j)) {
-                    return true;
+                    if (core_replicas_normal == core_replicas_total) {
+                        // Case A) all replicas are normal, but commit_max is exactly checkpoint
+                        // trigger.
+                        return vsr.Checkpoint.trigger_for_checkpoint(checkpoint_max) == commit_max;
+                    } else {
+                        // Case B) all replicas are in a view change or recovering head, they
+                        // can't learn which checkpoint is canonical without commit messages.
+                        return true;
+                    }
                 }
             }
         }

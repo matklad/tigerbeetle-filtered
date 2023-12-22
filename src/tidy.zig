@@ -83,6 +83,23 @@ test "tidy changelog" {
     }
 }
 
+test "tidy naughty list" {
+    var src = try fs.cwd().openDir("src", .{});
+    defer src.close();
+
+    for (naughty_list) |naughty_path| {
+        _ = src.statFile(naughty_path) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print(
+                    "path does not exist: src/{s}\n",
+                    .{naughty_path},
+                );
+            }
+            return err;
+        };
+    }
+}
+
 fn banned(source: []const u8) ?[]const u8 {
     // Note: must avoid banning ourselves!
     if (std.mem.indexOf(u8, source, "std." ++ "BoundedArray") != null) {
@@ -91,6 +108,15 @@ fn banned(source: []const u8) ?[]const u8 {
 
     if (std.mem.indexOf(u8, source, "trait." ++ "hasUniqueRepresentation") != null) {
         return "use stdx." ++ "has_unique_representation instead of std version";
+    }
+
+    // Ban "fixme" comments. This allows using fixe as reminders with teeth --- when working on a
+    // larger pull requests, it is often helpful to leave fixme comments as a reminder to oneself.
+    // This tidy rule ensures that the reminder is acted upon before code gets into main. That is:
+    // - use fixme for issues to be fixed in the same pull request,
+    // - use todo as general-purpose long-term remainders without enforcement.
+    if (std.mem.indexOf(u8, source, "FIX" ++ "ME") != null) {
+        return "FIX" ++ "ME comments must be addressed before getting to main";
     }
 
     return null;
@@ -174,15 +200,12 @@ const naughty_list = [_][]const u8{
     "io/test.zig",
     "io/windows.zig",
     "lsm/binary_search.zig",
-    "lsm/compaction.zig",
     "lsm/binary_search_benchmark.zig",
     "lsm/forest_fuzz.zig",
     "lsm/groove.zig",
     "lsm/level_data_iterator.zig",
     "lsm/level_index_iterator.zig",
     "lsm/manifest_level.zig",
-    "lsm/merge_iterator.zig",
-    "lsm/posted_groove.zig",
     "lsm/segmented_array_benchmark.zig",
     "lsm/segmented_array.zig",
     "lsm/set_associative_cache.zig",
@@ -196,15 +219,6 @@ const naughty_list = [_][]const u8{
     "state_machine/workload.zig",
     "statsd.zig",
     "storage.zig",
-    "test/cluster.zig",
-    "test/cluster/network.zig",
-    "test/cluster/state_checker.zig",
-    "test/conductor.zig",
-    "test/network.zig",
-    "test/packet_simulator.zig",
-    "test/priority_queue.zig",
-    "test/storage.zig",
-    "test/time.zig",
     "testing/aof.zig",
     "testing/cluster.zig",
     "testing/cluster/network.zig",
@@ -212,7 +226,6 @@ const naughty_list = [_][]const u8{
     "testing/hash_log.zig",
     "testing/low_level_hash_vectors.zig",
     "testing/packet_simulator.zig",
-    "testing/priority_queue.zig",
     "testing/state_machine.zig",
     "testing/storage.zig",
     "testing/time.zig",
@@ -221,16 +234,14 @@ const naughty_list = [_][]const u8{
     "tracer.zig",
     "vsr.zig",
     "vsr/client_replies.zig",
+    "vsr/client_sessions.zig",
     "vsr/client.zig",
     "vsr/clock.zig",
     "vsr/grid.zig",
     "vsr/journal.zig",
     "vsr/replica_test.zig",
     "vsr/replica.zig",
-    "vsr/superblock_client_sessions.zig",
-    "vsr/superblock_client_table.zig",
     "vsr/free_set.zig",
     "vsr/superblock_quorums.zig",
     "vsr/superblock.zig",
-    "vsr/sync.zig",
 };

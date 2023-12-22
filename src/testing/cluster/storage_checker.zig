@@ -3,14 +3,8 @@
 //! At each replica compact and checkpoint, check that storage is byte-for-byte identical across
 //! replicas.
 //!
-//! Areas verified at compaction (half-bar):
-//! - Acquired Grid blocks (ignores skipped recovery compactions)
-//!  TODO Because ManifestLog acquires blocks potentially several beats prior to actually writing
-//!  the block, this check will need to be removed or use a different strategy.
-//!
 //! Areas verified at checkpoint:
-//! - SuperBlock CheckpointState
-//! - SuperBlock trailers (FreeSet, ClientSessions)
+//! - SuperBlock vsr_state.checkpoint
 //! - ClientReplies (when repair finishes)
 //! - Acquired Grid blocks (when syncing finishes)
 //!
@@ -35,7 +29,7 @@ const Storage = @import("../storage.zig").Storage;
 ///
 /// (Track half-bars instead of beats because the on-disk state mid-compaction is
 /// nondeterministic; it depends on IO progress.)
-/// TODO: This will be deterministic across beats now.
+/// FIXME: This will be deterministic across beats now.
 const Compactions = std.ArrayList(u128);
 
 /// Maps from op_checkpoint to cumulative storage checksum.
@@ -48,7 +42,6 @@ const Checkpoints = std.AutoHashMap(u64, Checkpoint);
 
 const CheckpointArea = enum {
     superblock_checkpoint,
-    superblock_client_sessions,
     client_replies,
     grid,
 };
@@ -64,6 +57,9 @@ pub const StorageChecker = struct {
     free_set: vsr.FreeSet,
     free_set_buffer: []align(@alignOf(u64)) u8,
 
+    client_sessions: vsr.ClientSessions,
+    client_sessions_buffer: []align(@sizeOf(u256)) u8,
+
     pub fn init(allocator: std.mem.Allocator) !StorageChecker {
         var compactions = Compactions.init(allocator);
         errdefer compactions.deinit();
@@ -74,23 +70,34 @@ pub const StorageChecker = struct {
         var free_set = try vsr.FreeSet.init(allocator, Storage.grid_blocks_max);
         errdefer free_set.deinit(allocator);
 
+        var client_sessions = try vsr.ClientSessions.init(allocator);
+        errdefer client_sessions.deinit(allocator);
+
         var free_set_buffer = try allocator.alignedAlloc(
             u8,
             @alignOf(u64),
             vsr.FreeSet.encode_size_max(Storage.grid_blocks_max),
         );
-        errdefer allocator.free(free_set);
+        errdefer allocator.free(free_set_buffer);
+
+        var client_sessions_buffer =
+            try allocator.alignedAlloc(u8, @sizeOf(u256), vsr.ClientSessions.encode_size);
+        errdefer allocator.free(client_sessions_buffer);
 
         return StorageChecker{
             .compactions = compactions,
             .checkpoints = checkpoints,
             .free_set = free_set,
             .free_set_buffer = free_set_buffer,
+            .client_sessions = client_sessions,
+            .client_sessions_buffer = client_sessions_buffer,
         };
     }
 
     pub fn deinit(checker: *StorageChecker, allocator: std.mem.Allocator) void {
+        allocator.free(checker.client_sessions_buffer);
         allocator.free(checker.free_set_buffer);
+        checker.client_sessions.deinit(allocator);
         checker.free_set.deinit(allocator);
         checker.checkpoints.deinit();
         checker.compactions.deinit();
@@ -104,7 +111,6 @@ pub const StorageChecker = struct {
             superblock,
             std.enums.EnumSet(CheckpointArea).init(.{
                 .superblock_checkpoint = true,
-                .superblock_client_sessions = true,
                 .client_replies = !syncing,
                 .grid = !syncing,
             }),
@@ -120,7 +126,6 @@ pub const StorageChecker = struct {
             superblock,
             std.enums.EnumSet(CheckpointArea).init(.{
                 .superblock_checkpoint = true,
-                .superblock_client_sessions = true,
                 // The replica may have have already committed some addition prepares atop the
                 // checkpoint, so its client-replies zone will have mutated.
                 .client_replies = false,
@@ -143,14 +148,8 @@ pub const StorageChecker = struct {
                     vsr.checksum(std.mem.asBytes(&superblock.working.vsr_state.checkpoint)),
                 );
             }
-            if (areas.contains(.superblock_client_sessions)) {
-                checkpoint.put(
-                    .superblock_client_sessions,
-                    checksum_trailer(superblock, .client_sessions),
-                );
-            }
             if (areas.contains(.client_replies)) {
-                checkpoint.put(.client_replies, checksum_client_replies(superblock));
+                checkpoint.put(.client_replies, checker.checksum_client_replies(superblock));
             }
             if (areas.contains(.grid)) {
                 checkpoint.put(.grid, checker.checksum_grid(superblock));
@@ -196,26 +195,44 @@ pub const StorageChecker = struct {
         }
     }
 
-    fn checksum_trailer(superblock: *const SuperBlock, trailer: vsr.SuperBlockTrailer) u128 {
-        const trailer_size = superblock.working.trailer_size(trailer);
-        const trailer_checksum = superblock.working.trailer_checksum(trailer);
-
-        var copy: u8 = 0;
-        while (copy < constants.superblock_copies) : (copy += 1) {
-            const trailer_start = trailer.zone().start_for_copy(copy);
-
-            assert(trailer_checksum ==
-                vsr.checksum(superblock.storage.memory[trailer_start..][0..trailer_size]));
-        }
-
-        return trailer_checksum;
-    }
-
-    fn checksum_client_replies(superblock: *const SuperBlock) u128 {
+    fn checksum_client_replies(checker: *StorageChecker, superblock: *const SuperBlock) u128 {
         assert(superblock.working.vsr_state.sync_op_max == 0);
 
-        var checksum: u128 = 0;
-        for (superblock.client_sessions.entries, 0..) |client_session, slot| {
+        const client_sessions_size = superblock.working.vsr_state.checkpoint.client_sessions_size;
+        if (client_sessions_size > 0) {
+            const checkpoint = &superblock.working.vsr_state.checkpoint;
+            var client_sessions_block: vsr.BlockReference = .{
+                .address = checkpoint.client_sessions_last_block_address,
+                .checksum = checkpoint.client_sessions_last_block_checksum,
+            };
+
+            var client_sessions_cursor: usize = client_sessions_size;
+            while (true) {
+                const block =
+                    superblock.storage.grid_block(client_sessions_block.address).?;
+                assert(schema.header_from_block(block).checksum == client_sessions_block.checksum);
+
+                const block_body = schema.TrailerNode.body(block);
+                client_sessions_cursor -= block_body.len;
+                stdx.copy_disjoint(
+                    .inexact,
+                    u8,
+                    checker.client_sessions_buffer[client_sessions_cursor..],
+                    block_body,
+                );
+
+                client_sessions_block = schema.TrailerNode.previous(block) orelse break;
+            }
+            assert(client_sessions_cursor == 0);
+        }
+        assert(vsr.checksum(checker.client_sessions_buffer[0..client_sessions_size]) ==
+            superblock.working.vsr_state.checkpoint.client_sessions_checksum);
+
+        checker.client_sessions.decode(checker.client_sessions_buffer[0..client_sessions_size]);
+        defer checker.client_sessions.reset();
+
+        var checksum = vsr.ChecksumStream.init();
+        for (checker.client_sessions.entries, 0..) |client_session, slot| {
             if (client_session.session == 0) {
                 // Empty slot.
             } else {
@@ -224,13 +241,13 @@ pub const StorageChecker = struct {
                 if (client_session.header.size == @sizeOf(vsr.Header)) {
                     // ClientReplies won't store this entry.
                 } else {
-                    checksum ^= vsr.checksum(superblock.storage.area_memory(
+                    checksum.add(superblock.storage.area_memory(
                         .{ .client_replies = .{ .slot = slot } },
                     )[0..vsr.sector_ceil(client_session.header.size)]);
                 }
             }
         }
-        return checksum;
+        return checksum.checksum();
     }
 
     fn checksum_grid(checker: *StorageChecker, superblock: *const SuperBlock) u128 {
@@ -249,7 +266,7 @@ pub const StorageChecker = struct {
                 const block = superblock.storage.grid_block(free_set_block.address).?;
                 assert(schema.header_from_block(block).checksum == free_set_block.checksum);
 
-                const encoded_words = schema.FreeSetNode.encoded_words(block);
+                const encoded_words = schema.TrailerNode.body(block);
                 free_set_cursor -= encoded_words.len;
                 stdx.copy_disjoint(
                     .inexact,
@@ -258,10 +275,12 @@ pub const StorageChecker = struct {
                     encoded_words,
                 );
 
-                free_set_block = schema.FreeSetNode.previous(block) orelse break;
+                free_set_block = schema.TrailerNode.previous(block) orelse break;
             }
             assert(free_set_cursor == 0);
         }
+        assert(vsr.checksum(checker.free_set_buffer[0..free_set_size]) ==
+            superblock.working.vsr_state.checkpoint.free_set_checksum);
 
         checker.free_set.decode(checker.free_set_buffer[0..free_set_size]);
         defer checker.free_set.reset();

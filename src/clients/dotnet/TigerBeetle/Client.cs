@@ -9,7 +9,7 @@ namespace TigerBeetle
 {
     public sealed class Client : IDisposable
     {
-        private const int DEFAULT_CONCURRENCY_MAX = 32;
+        private const int DEFAULT_CONCURRENCY_MAX = 256; // arbitrary
 
         private readonly UInt128 clusterID;
         private readonly NativeClient nativeClient;
@@ -118,6 +118,17 @@ namespace TigerBeetle
         {
             return nativeClient.CallRequestAsync<Transfer, UInt128>(TBOperation.LookupTransfers, ids);
         }
+
+        public Transfer[] GetAccountTransfers(GetAccountTransfers filter)
+        {
+            return nativeClient.CallRequest<Transfer, GetAccountTransfers>(TBOperation.GetAccountTransfers, new[] { filter });
+        }
+
+        public Task<Transfer[]> GetAccountTransfersAsync(GetAccountTransfers filter)
+        {
+            return nativeClient.CallRequestAsync<Transfer, GetAccountTransfers>(TBOperation.GetAccountTransfers, new[] { filter });
+        }
+
 
         public void Dispose()
         {

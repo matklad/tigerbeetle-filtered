@@ -14,6 +14,8 @@ const GridType = @import("../vsr/grid.zig").GridType;
 const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
+const ScanBufferPool = @import("scan_buffer.zig").ScanBufferPool;
+
 const table_count_max = @import("tree.zig").table_count_max;
 
 pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
@@ -177,9 +179,12 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         node_pool: *NodePool,
         manifest_log: ManifestLog,
         manifest_log_progress: enum { idle, compacting, done, skip } = .idle,
+
         compaction_blocks: []Grid.BlockPtr,
         compaction_reads: []Grid.FatRead,
         compaction_writes: []Grid.FatWrite,
+
+        scan_buffer_pool: ScanBufferPool,
 
         pub fn init(
             allocator: mem.Allocator,
@@ -238,6 +243,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const compaction_writes = try allocator.alloc(Grid.FatWrite, 1024);
             errdefer allocator.free(compaction_writes);
 
+            const scan_buffer_pool = try ScanBufferPool.init(allocator);
+            errdefer scan_buffer_pool.deinit(allocator);
+
             return Forest{
                 .grid = grid,
                 .grooves = grooves,
@@ -247,6 +255,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 .compaction_blocks = compaction_blocks,
                 .compaction_reads = compaction_reads,
                 .compaction_writes = compaction_writes,
+
+                .scan_buffer_pool = scan_buffer_pool,
             };
         }
 
@@ -260,6 +270,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             allocator.destroy(forest.node_pool);
 
             // FIXME: Deinit compaction_blocks
+            forest.scan_buffer_pool.deinit(allocator);
         }
 
         pub fn reset(forest: *Forest) void {
@@ -269,6 +280,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             forest.manifest_log.reset();
             forest.node_pool.reset();
+            forest.scan_buffer_pool.reset();
 
             forest.* = .{
                 // Don't reset the grid – replica is responsible for grid cancellation.
@@ -280,6 +292,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 .compaction_blocks = forest.compaction_blocks,
                 .compaction_reads = forest.compaction_reads,
                 .compaction_writes = forest.compaction_writes,
+
+                .scan_buffer_pool = forest.scan_buffer_pool,
             };
         }
 

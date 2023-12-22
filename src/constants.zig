@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const vsr = @import("vsr.zig");
 const tracer = @import("tracer.zig");
 const Config = @import("config.zig").Config;
+const stdx = @import("stdx.zig");
 
 pub const config = @import("config.zig").configs.current;
 
@@ -39,6 +40,23 @@ pub const vsr_operations_reserved: u8 = 128;
 
 comptime {
     assert(vsr_operations_reserved <= std.math.maxInt(u8));
+}
+
+pub const vsr_checkpoint_interval = journal_slot_count -
+    lsm_batch_multiple -
+    lsm_batch_multiple * stdx.div_ceil(pipeline_prepare_queue_max, lsm_batch_multiple);
+
+comptime {
+    // Invariant: to guarantee durability, a log entry from a previous checkpoint can be overwritten
+    // only when there is a quorum of replicas at the next checkpoint.
+    //
+    // This assert guarantees that when a prepare gets bumped from the log, there is a prepare
+    // _committed_ on top of the next checkpoint, which in turn guarantees the existence of a
+    // checkpoint quorum.
+    assert(vsr_checkpoint_interval + lsm_batch_multiple + pipeline_prepare_queue_max <=
+        journal_slot_count);
+    assert(vsr_checkpoint_interval >= lsm_batch_multiple);
+    assert(vsr_checkpoint_interval % lsm_batch_multiple == 0);
 }
 
 /// The maximum number of clients allowed per cluster, where each client has a unique 128-bit ID.
@@ -180,22 +198,6 @@ comptime {
     assert(message_body_size_max >= @sizeOf(vsr.ReconfigurationRequest));
     assert(message_body_size_max >= @sizeOf(vsr.BlockRequest));
     assert(message_body_size_max >= @sizeOf(vsr.CheckpointState));
-}
-
-/// The maximum body size of:
-/// - command=sync_free_set
-/// - command=sync_client_sessions
-///
-/// In practice, this should always be as high as possible to minimize the number of round trips
-/// required for sync.
-/// It is configurable to make testing multipart trailers simple.
-pub const sync_trailer_message_body_size_max =
-    config.process.sync_trailer_message_body_size_max orelse
-    message_body_size_max;
-
-comptime {
-    assert(sync_trailer_message_body_size_max > 0);
-    assert(sync_trailer_message_body_size_max <= message_body_size_max);
 }
 
 /// The maximum number of Viewstamped Replication prepare messages that can be inflight at a time.
@@ -447,8 +449,6 @@ comptime {
 ///
 /// The superblock contains local state for the replica and therefore cannot be replicated remotely.
 /// Loss of the superblock would represent loss of the replica and so it must be protected.
-/// Since each superblock copy also copies the superblock trailer (around 33 MiB), setting this
-/// beyond 4 copies (or decreasing block_size < 64 KiB) can result in a superblock zone > 264 MiB.
 ///
 /// This can mean checkpointing latencies in the rare extreme worst-case of at most 264ms, although
 /// this would require EWAH compression of our block free set to have zero effective compression.
@@ -473,7 +473,7 @@ comptime {
 ///
 /// This is a "firm" limit --- while it is a compile-time constant, it does not affect data file
 /// layout and can be safely changed for an existing cluster.
-pub const storage_size_max = config.process.storage_size_max;
+pub const storage_size_limit_max = config.process.storage_size_limit_max;
 
 /// The unit of read/write access to LSM manifest and LSM table blocks in the block storage zone.
 ///
@@ -622,3 +622,7 @@ pub const aof_record = config.process.aof_record;
 /// Place us in a special recovery state, where we accept timestamps passed in to us. Used to
 /// replay our AOF.
 pub const aof_recovery = config.process.aof_recovery;
+
+/// Maximum number of tree scans that can be performed by a single query.
+/// NOTE: Each condition in a query is a scan, for example `WHERE a=0 AND b=1` needs 2 scans.
+pub const lsm_scans_max = config.cluster.lsm_scans_max;

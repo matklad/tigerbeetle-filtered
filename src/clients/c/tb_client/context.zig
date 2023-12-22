@@ -71,14 +71,13 @@ pub fn ContextType(
                 .create_transfers,
                 .lookup_accounts,
                 .lookup_transfers,
+                .get_account_transfers,
             };
-
             inline for (allowed_operations) |operation| {
                 if (op == @intFromEnum(operation)) {
                     return @sizeOf(Client.StateMachine.Event(operation));
                 }
             }
-
             return null;
         }
 
@@ -120,7 +119,9 @@ pub fn ContextType(
 
             log.debug("{}: init: initializing", .{context.client_id});
 
-            if (concurrency_max == 0 or concurrency_max > 4096) {
+            // Arbitrary limit: To take advantage of batching, the `concurrency_max` should be set
+            // high enough to allow concurrent requests to completely fill the message body.
+            if (concurrency_max == 0 or concurrency_max > 8192) {
                 return error.ConcurrencyMaxInvalid;
             }
 
@@ -241,9 +242,7 @@ pub fn ContextType(
             }
         }
 
-        pub fn request(self: *Context, packet: *Packet) void {
-            assert(self.client.messages_available > 0);
-
+        pub fn request(self: *Context, packet: *Packet) Client.BatchError!void {
             // Get the size of each request structure in the packet.data:
             const event_size: usize = operation_event_size(packet.operation) orelse {
                 return self.on_complete(packet, error.InvalidOperation);
@@ -260,24 +259,21 @@ pub fn ContextType(
                 return self.on_complete(packet, error.TooMuchData);
             }
 
-            const message = self.client.get_message();
-            errdefer self.client.release(message);
+            const batch = try self.client.batch_get(
+                @enumFromInt(packet.operation),
+                @divExact(readable.len, event_size),
+            );
 
-            // Write the packet data to the message:
-            const writable = message.buffer[@sizeOf(Header)..][0..constants.message_body_size_max];
-            stdx.copy_disjoint(.inexact, u8, writable, readable);
-            const wrote = readable.len;
+            stdx.copy_disjoint(.exact, u8, batch.slice(), readable);
 
             // Submit the message for processing:
-            self.client.request(
+            self.client.batch_submit(
                 @as(u128, @bitCast(UserData{
                     .self = self,
                     .packet = packet,
                 })),
                 Context.on_result,
-                @as(Client.StateMachine.Operation, @enumFromInt(packet.operation)),
-                message,
-                wrote,
+                batch,
             );
         }
 

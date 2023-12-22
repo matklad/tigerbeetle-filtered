@@ -162,6 +162,7 @@
               <exclude>com/tigerbeetle/PacketAcquireStatus.class</exclude>
               <exclude>com/tigerbeetle/InitializationStatus.class</exclude>
               <exclude>com/tigerbeetle/TransferFlags.class</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersFlags.class</exclude>
 
               <!-- Excluding the benchmark -->
               <exclude>benchmark/Benchmark.class</exclude>
@@ -187,6 +188,8 @@
               <exclude>com/tigerbeetle/PacketStatus.java</exclude>
               <exclude>com/tigerbeetle/TransferBatch.java</exclude>
               <exclude>com/tigerbeetle/TransferFlags.java</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersFlags.java</exclude>
+              <exclude>com/tigerbeetle/GetAccountTransfersBatch.java</exclude>
             </excludes>
           </configuration>
         </plugin>
@@ -242,7 +245,7 @@
               <arguments>
                 <argument>build</argument>
                 <argument>java_client</argument>
-                <argument>-Doptimize=ReleaseSafe</argument>
+                <argument>-Drelease</argument>
                 <argument>-Dconfig=production</argument>
               </arguments>
             </configuration>
@@ -398,6 +401,7 @@
             <serverId>ossrh</serverId>
             <nexusUrl>https://s01.oss.sonatype.org</nexusUrl>
             <autoReleaseAfterClose>true</autoReleaseAfterClose>
+            <stagingProgressTimeoutMinutes>30</stagingProgressTimeoutMinutes>
         </configuration>
       </plugin>
     </plugins>

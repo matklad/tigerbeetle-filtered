@@ -21,8 +21,13 @@ pub const TableUsage = enum {
     /// If your usage fits this pattern:
     /// * Only put keys which are not present.
     /// * Only remove keys which are present.
-    /// * TableKey == TableValue (modulo padding, eg CompositeKey)
-    /// Then we can unlock additional optimizations.
+    /// * TableKey == TableValue (modulo padding, eg CompositeKey).
+    /// Then we can unlock additional optimizations:
+    /// * Immediately cancel out a tombstone and the corresponding insert, without waiting for the
+    ///   tombstone to sink to the bottom of the LSM tree: absence of updates guarantees that
+    ///   there are no otherwise visible values on lower level.
+    /// * Immediately cancel out an insert and a tombstone for a "different" insert: as the values
+    ///   are equal, it is correct to just resurrect an older value.
     secondary_index,
 };
 
@@ -93,7 +98,6 @@ pub fn TableType(
             assert(stdx.no_padding(Value));
 
             // These impact our calculation of:
-            // * the superblock trailer size, and
             // * the manifest log layout for alignment.
             assert(key_size >= 8);
             assert(key_size <= 32);
@@ -246,6 +250,7 @@ pub fn TableType(
 
             data_block_count: u32 = 0,
             value_count: u32 = 0,
+            value_count_total: u32 = 0, // Count across the entire table.
 
             // TODO: data_block should be data_blocks, so we can pass down multiple blocks
             // here
@@ -369,6 +374,7 @@ pub fn TableType(
                 }
 
                 builder.data_block_count += 1;
+                builder.value_count_total += builder.value_count;
                 builder.value_count = 0;
             }
 
@@ -424,6 +430,7 @@ pub fn TableType(
                     .snapshot_min = options.snapshot_min,
                     .key_min = builder.key_min,
                     .key_max = builder.key_max,
+                    .value_count = builder.value_count_total,
                 };
 
                 assert(info.snapshot_max == math.maxInt(u64));

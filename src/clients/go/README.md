@@ -91,7 +91,7 @@ tbAddress := os.Getenv("TB_ADDRESS")
 if len(tbAddress) == 0 {
   tbAddress = "3000"
 }
-client, err := NewClient(ToUint128(0), []string{tbAddress}, 32)
+client, err := NewClient(ToUint128(0), []string{tbAddress}, 256)
 if err != nil {
 	log.Printf("Error creating client: %s", err)
 	return
@@ -100,7 +100,7 @@ defer client.Close()
 ```
 
 The third argument to `NewClient` is a `uint` max concurrency
-setting. `32` is a good default and can increase to `4096`
+setting. `256` is a good default and can increase to `8192`
 as you need increased throughput.
 
 The following are valid addresses:
@@ -414,6 +414,36 @@ if err != nil {
 log.Println(transfers)
 ```
 
+## Get Account Transfers
+
+NOTE: This is a preview API that is subject to breaking changes once we have
+a stable querying API.
+
+Fetches the transfers involving a given account, allowing basic filter and pagination
+capabilities.
+
+The transfers in the response are sorted by `timestamp` in chronological or
+reverse-chronological order.
+
+```go
+filter := GetAccountTransfers{
+		AccountID: ToUint128(2),
+		Timestamp: 0, // No filter by Timestamp.
+		Limit:     10, // Limit to ten transfers at most.
+		Flags:     GetAccountTransfersFlags{
+			Debits:    true, // Include transfer from the debit side.
+			Credits:   true, // Include transfer from the credit side.
+			Reversed:  true, // Sort by timestamp in reverse-chronological order.
+		}.ToUint32(),
+}
+transfers, err = client.GetAccountTransfers(filter)
+if err != nil {
+	log.Printf("Could not fetch transfers: %s", err)
+	return
+}
+log.Println(transfers)
+```
+
 ## Linked Events
 
 When the `linked` flag is specified for an account when creating accounts or
@@ -471,7 +501,7 @@ git clone https://github.com/tigerbeetle/tigerbeetle
 cd tigerbeetle
 git submodule update --init --recursive
 ./scripts/install_zig.sh
-./zig/zig build go_client -Doptimize=ReleaseSafe -Dconfig=production
+./zig/zig build go_client -Drelease -Dconfig=production
 cd src/clients/go
 if [ "$TEST" = "true" ]; then go test; else echo "Skipping client unit tests"; fi
 ```
@@ -485,7 +515,7 @@ git clone https://github.com/tigerbeetle/tigerbeetle
 cd tigerbeetle
 git submodule update --init --recursive
 .\scripts\install_zig.bat
-.\zig\zig build go_client -Doptimize=ReleaseSafe -Dconfig=production
+.\zig\zig build go_client -Drelease -Dconfig=production
 cd src\clients\go
 if ($env:TEST -eq 'true') { go test } else { echo "Skipping client unit test" }
 ```

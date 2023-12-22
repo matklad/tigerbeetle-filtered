@@ -120,7 +120,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             assert(options.replica_count <= 6);
             assert(options.client_count > 0);
             assert(options.storage_size_limit % constants.sector_size == 0);
-            assert(options.storage_size_limit <= constants.storage_size_max);
+            assert(options.storage_size_limit <= constants.storage_size_limit_max);
             assert(options.storage.replica_index == null);
             assert(options.storage.fault_atlas == null);
 
@@ -459,12 +459,22 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             request_message: *Message,
             request_body_size: usize,
         ) void {
-            cluster.clients[client_index].request(
+            const client = &cluster.clients[client_index];
+            const message = request_message.build(.request);
+
+            message.header.* = .{
+                .client = client.id,
+                .request = undefined, // Set by client.raw_request.
+                .cluster = client.cluster,
+                .command = .request,
+                .operation = vsr.Operation.from(StateMachine, request_operation),
+                .size = @intCast(@sizeOf(vsr.Header) + request_body_size),
+            };
+
+            client.raw_request(
                 undefined,
                 request_callback,
-                request_operation,
-                request_message,
-                request_body_size,
+                message,
             );
         }
 
@@ -548,7 +558,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                     assert(cluster.replica_diverged.isSet(event_data.replica));
                 },
                 .sync_stage_changed => switch (replica.syncing) {
-                    .requesting_trailers => {
+                    .requesting_checkpoint => {
                         cluster.log_replica(.sync_commenced, replica.replica);
                         cluster.sync_checker.replica_sync_start(replica);
                     },
@@ -642,7 +652,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
 
                 info = std.fmt.bufPrint(&info_buffer, "" ++
                     "{[view]:>4}V " ++
-                    "{[commit_min]:>3}/{[commit_max]:_>3}C " ++
+                    "{[op_checkpoint]:>3}/{[commit_min]:_>3}/{[commit_max]:_>3}C " ++
                     "{[journal_op_min]:>3}:{[journal_op_max]:_>3}Jo " ++
                     "{[journal_faulty]:>2}/{[journal_dirty]:_>2}J! " ++
                     "{[wal_op_min]:>3}:{[wal_op_max]:_>3}Wo " ++
@@ -651,6 +661,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                     "{[grid_blocks_global]:>2}G! " ++
                     "{[grid_blocks_repair]:>3}G?", .{
                     .view = replica.view,
+                    .op_checkpoint = replica.op_checkpoint(),
                     .commit_min = replica.commit_min,
                     .commit_max = replica.commit_max,
                     .journal_op_min = journal_op_min,
