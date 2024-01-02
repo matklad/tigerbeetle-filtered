@@ -19,10 +19,12 @@ const Shell = @import("../shell.zig");
 
 const ci = @import("./ci.zig");
 const release = @import("./release.zig");
+const macro_benchmark = @import("./macro_benchmark.zig");
 
 const CliArgs = union(enum) {
     ci: ci.CliArgs,
     release: release.CliArgs,
+    benchmark,
 };
 
 pub fn main() !void {
@@ -48,5 +50,6 @@ pub fn main() !void {
     switch (cli_args) {
         .ci => |args_ci| try ci.main(shell, gpa, args_ci),
         .release => |args_release| try release.main(shell, gpa, args_release),
+        .benchmark => try macro_benchmark.main(shell, gpa),
     }
 }
