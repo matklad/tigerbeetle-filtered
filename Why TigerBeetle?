@@ -52,3 +52,11 @@ https://github.com/tigerbeetle/tigerbeetle/blob/IronBeetle/Why%20TigerBeetle%3F
 * 36: Zig:
         not necessary Rust: ^34, 24, 35
         Zig in particular: ^8, 33, 28
+  37: Event sourcing: 12, 2
+
+
+State-based representation:
+State: HashMap<AccountId, AccountBallances>
+
+Event-based:
+State: List<Transfers>
