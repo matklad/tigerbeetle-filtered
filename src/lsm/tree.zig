@@ -85,7 +85,7 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
         const KeyRange = Manifest.KeyRange;
 
         const CompactionType = @import("compaction.zig").CompactionType;
-        const Compaction = CompactionType(Table, Tree, Storage);
+        pub const Compaction = CompactionType(Table, Tree, Storage);
 
         pub const LookupMemoryResult = union(enum) {
             negative,
@@ -160,6 +160,8 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
                 compactions[i] = try Compaction.init(config, grid, @intCast(i));
             }
             errdefer for (compactions) |*c| c.deinit();
+
+            std.log.info("Size of compaction: {}", .{@sizeOf(Compaction)});
 
             return Tree{
                 .grid = grid,

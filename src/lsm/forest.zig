@@ -16,6 +16,7 @@ const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
 const ScanBufferPool = @import("scan_buffer.zig").ScanBufferPool;
+const CompactionInfo = @import("compaction.zig").CompactionInfo;
 
 const table_count_max = @import("tree.zig").table_count_max;
 
@@ -145,10 +146,103 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         break :tree_infos tree_infos_sorted[0..];
     };
 
+    // FIXME: How could we move these into compaction.zig?
+    const CompactionDispatcher = T: {
+        var type_info = @typeInfo(union(enum) {});
+
+        // Union fields for each compaction type.
+        for (_tree_infos) |tree_info| {
+            const Compaction = tree_info.Tree.Compaction;
+            // @compileLog(@typeName(tree_info.Tree));
+            // @compileLog(@typeName(Compaction));
+            const type_name = @typeName(Compaction);
+
+            for (type_info.Union.fields) |field| {
+                if (std.mem.eql(u8, field.name, type_name)) {
+                    break;
+                }
+            } else {
+                type_info.Union.fields = type_info.Union.fields ++ [_]std.builtin.Type.UnionField{.{
+                    .name = type_name,
+                    .type = *Compaction,
+                    .alignment = @alignOf(*Compaction),
+                }};
+            }
+        }
+
+        // We need a tagged union for dynamic dispatching.
+        type_info.Union.tag_type = blk: {
+            const union_fields = type_info.Union.fields;
+            var tag_fields: [union_fields.len]std.builtin.Type.EnumField =
+                undefined;
+            for (&tag_fields, union_fields, 0..) |*tag_field, union_field, i| {
+                tag_field.* = .{
+                    .name = union_field.name,
+                    .value = i,
+                };
+            }
+
+            break :blk @Type(.{ .Enum = .{
+                .tag_type = std.math.IntFittingRange(0, tag_fields.len - 1),
+                .fields = &tag_fields,
+                .decls = &.{},
+                .is_exhaustive = true,
+            } });
+        };
+
+        break :T @Type(type_info);
+    };
+
+    const Grid = GridType(_Storage);
+
+    const CompactionInterface = struct {
+        dispatcher: CompactionDispatcher,
+        info: CompactionInfo,
+
+        pub fn init(info: CompactionInfo, compaction: anytype) @This() {
+            const Compaction = @TypeOf(compaction.*);
+            const type_name = @typeName(Compaction);
+
+            return .{
+                .info = info,
+                .dispatcher = @unionInit(CompactionDispatcher, type_name, compaction),
+            };
+        }
+
+        pub fn beat_setup(self: *const @This(), blocks: []BlockPtr, grid_reads: []Grid.FatRead, grid_writes: []Grid.FatWrite) void {
+            return switch (self.dispatcher) {
+                inline else => |compaction_impl| compaction_impl.beat_setup(blocks, grid_reads, grid_writes),
+            };
+        }
+
+        pub fn blip_read(self: *const @This(), callback: *const fn (*anyopaque, u64, u64) void) void {
+            return switch (self.dispatcher) {
+                inline else => |compaction_impl| compaction_impl.blip_read(callback),
+            };
+        }
+
+        pub fn blip_cpu(self: *const @This()) void {
+            return switch (self.dispatcher) {
+                inline else => |compaction_impl| compaction_impl.blip_cpu(),
+            };
+        }
+
+        pub fn blip_write(self: *const @This()) void {
+            return switch (self.dispatcher) {
+                inline else => |compaction_impl| compaction_impl.blip_write(),
+            };
+        }
+
+        pub fn beat_finish(self: *const @This()) void {
+            return switch (self.dispatcher) {
+                inline else => |compaction_impl| compaction_impl.beat_finish(),
+            };
+        }
+    };
+
     return struct {
         const Forest = @This();
 
-        const Grid = GridType(Storage);
         const ManifestLog = ManifestLogType(Storage);
 
         const Callback = *const fn (*Forest) void;
@@ -169,11 +263,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             checkpoint: struct { callback: Callback },
             compact: struct {
                 op: u64,
-                /// Count which groove compactions are in progress.
-                pending: GroovesBitSet = GroovesBitSet.initFull(),
                 callback: Callback,
             },
         } = null,
+        bar_compactions: stdx.BoundedArray(CompactionInterface, (tree_id_range.max - tree_id_range.min) * constants.lsm_levels) = .{},
 
         grid: *Grid,
         grooves: Grooves,
@@ -357,53 +450,72 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const first_beat = compaction_beat == 0;
             const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
-            // "Setup" loop
-            inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
-                var tree = tree_for_id(forest, tree_id);
-                // FIXME: Remember to remove me slice
-                for (tree.compactions[0..1], 0..) |*compaction, i| {
-                    std.log.info("Tree: {s}@{}; compaction into level: {}", .{ tree.config.name, op, i });
+            // Setup loop, runs only on the first beat of every bar, before any async work is done.
+            if (first_beat) {
+                assert(forest.bar_compactions.count() == 0);
 
-                    // This will return how many compactions and stuff this level needs to do...
-                    if (first_beat) {
-                        const work = compaction.bar_setup(tree, op);
-                        _ = work;
+                inline for (0..constants.lsm_levels) |level_b| {
+                    inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                        var tree = tree_for_id(forest, tree_id);
+                        assert(tree.compactions.len == constants.lsm_levels);
 
-                        compaction.bar_setup_budget(32, forest.compaction_blocks[32..48]);
-                    }
+                        var compaction = &tree.compactions[level_b];
 
-                    if (op > constants.lsm_batch_multiple) {
-                        // Then we'll set up the beat depending on what buffers we have available.
-                        _ = compaction.beat_setup(.{
-                            .input_index_blocks = forest.compaction_blocks[0..16],
-                            .input_data_blocks = forest.compaction_blocks[16..32],
-                            .output_data_blocks = forest.compaction_blocks[48..64],
-                            .grid_reads = forest.compaction_reads[0..32],
-                            .grid_writes = forest.compaction_writes[0..32],
-                        });
-                        compaction.blip_read();
+                        std.log.info("Target Level: {}, Tree: {s}@{}", .{ level_b, tree.config.name, op });
+
+                        // This will return how many compactions and stuff this level needs to do...
+                        const maybe_info = compaction.bar_setup(tree, op, forest);
+                        if (maybe_info) |info| {
+                            // FIXME: Assert len?
+                            forest.bar_compactions.append_assume_capacity(CompactionInterface.init(info, compaction));
+                            std.log.info("... need to do: {?}", .{info});
+
+                            // FIXME: Move this outside the loop since we need to do it once we know everyhthing we must do.
+                            // +1 for len to count
+                            compaction.bar_setup_budget(constants.lsm_batch_multiple - 1, forest.compaction_blocks[1000..1024]);
+                        } else {
+                            std.log.info("... nothing to do", .{});
+                        }
                     }
                 }
             }
 
-            // "Finish" loop
-            inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
-                var tree = tree_for_id(forest, tree_id);
-                // FIXME: Remember to remove me slice
-                for (tree.compactions[0..1], 0..) |*compaction, i| {
-                    _ = i;
-                    if (op > constants.lsm_batch_multiple) {
-                        compaction.beat_finish();
-                    }
+            const compactions = &forest.bar_compactions;
+            // Compaction only starts > lsm_batch_multiple because nothing compacts in the first bar.
+            if (op > constants.lsm_batch_multiple) {
+                for (compactions.slice()) |compaction| {
+                    // Then we'll set up the beat depending on what buffers we have available.
+                    _ = compaction.beat_setup(
+                        forest.compaction_blocks[0..1000],
+                        forest.compaction_reads,
+                        forest.compaction_writes,
+                    );
+                    // compaction.blip_read(Forest.blip_callback);
+                    // compaction.blip_cpu();
+                    // compaction.blip_write();
 
-                    // FIXME: Control flow here is super messy ATM. Want to split out the < batch multiple stuff.
-                    if (last_beat) {
+                    compaction.beat_finish();
+                }
+            }
+
+            // Finish loop, runs only on the last beat of every bar, after all async work is done.
+            // FIXME: This will need to be split oujt into _finish
+            if (last_beat) {
+                inline for (0..constants.lsm_levels) |level_b| {
+                    inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                        var tree = tree_for_id(forest, tree_id);
+                        assert(tree.compactions.len == constants.lsm_levels);
+
+                        var compaction = &tree.compactions[level_b];
                         compaction.bar_finish(op, tree);
                     }
                 }
+
+                // FIXME: actually it shoujld pop and we should assert len == 0.
+                forest.bar_compactions.clear();
             }
 
-            // Groove sync compaction...
+            // Groove sync compaction - must be done after all async work for the beat completes???
             inline for (std.meta.fields(Grooves)) |field| {
                 @field(forest.grooves, field.name).compact(op);
             }
@@ -428,9 +540,15 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             forest.progress = .{ .compact = .{
                 .op = op,
                 .callback = callback,
-                .pending = GroovesBitSet.initEmpty(),
             } };
+
             forest.compact_callback();
+        }
+
+        fn blip_callback(forest_opaque: *anyopaque, tree_id: u64, level_b: u64) void {
+            var forest: *Forest = @ptrCast(@alignCast(forest_opaque));
+
+            std.log.info("Blip callback for: {*} {} {}", .{ forest, tree_id, level_b });
         }
 
         // FIXME: This mixes both manifest and non-manifest compaction
@@ -440,7 +558,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             forest.verify_table_extents();
 
             const progress = &forest.progress.?.compact;
-            if (progress.pending.count() > 0) return;
 
             const half_bar_end =
                 (progress.op + 1) % @divExact(constants.lsm_batch_multiple, 2) == 0;

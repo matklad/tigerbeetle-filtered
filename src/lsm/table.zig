@@ -254,6 +254,24 @@ pub fn TableType(
 
             state: enum { no_blocks, index_block, index_and_data_block } = .no_blocks,
 
+            pub fn set_index_block(builder: *Builder, block: BlockPtr) void {
+                assert(builder.state == .no_blocks);
+                assert(builder.data_block_count == 0);
+                assert(builder.value_count == 0);
+                assert(builder.value_count_total == 0);
+
+                builder.index_block = block;
+                builder.state = .index_block;
+            }
+
+            pub fn set_data_block(builder: *Builder, block: BlockPtr) void {
+                assert(builder.state == .index_block);
+                assert(builder.value_count == 0);
+
+                builder.data_block = block;
+                builder.state = .index_and_data_block;
+            }
+
             /// The caller must ensure blocks are released before resetting.
             pub fn reset(builder: *Builder) void {
                 assert(builder.state == .no_blocks);
@@ -289,7 +307,7 @@ pub fn TableType(
                 tree_id: u16,
             };
 
-            pub fn data_block_finish(builder: *Builder, options: DataFinishOptions) BlockPtr {
+            pub fn data_block_finish(builder: *Builder, options: DataFinishOptions) void {
                 assert(builder.state == .index_and_data_block);
 
                 // For each block we write the sorted values,
@@ -371,12 +389,8 @@ pub fn TableType(
                 builder.data_block_count += 1;
                 builder.value_count_total += builder.value_count;
                 builder.value_count = 0;
-
-                const data_block = builder.data_block;
-                builder.state = .index_block;
                 builder.data_block = undefined;
-
-                return data_block;
+                builder.state = .index_block;
             }
 
             pub fn index_block_empty(builder: *const Builder) bool {
