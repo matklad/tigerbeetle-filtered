@@ -15,6 +15,116 @@ pub fn TableMemoryType(comptime Table: type) type {
     return struct {
         const TableMemory = @This();
 
+        pub const Iterator = struct {
+            table_memory: *TableMemory,
+            source_index: usize = 0,
+
+            fn init(table_memory: *TableMemory) Iterator {
+                const source = table_memory.values_used();
+                assert(source.len > 0);
+
+                if (constants.verify) {
+                    // The input may have duplicate keys (last one wins), but keys must be
+                    // non-decreasing.
+                    // A source length of 1 is always non-decreasing.
+                    for (source[0 .. source.len - 1], source[1..source.len]) |*value, *value_next| {
+                        assert(key_from_value(value) <= key_from_value(value_next));
+                    }
+                }
+
+                if (constants.verify) {
+                    // Our output must be strictly increasing.
+                    // An output length of 1 is always strictly increasing.
+                    const verify_iterator = Iterator{ .table_memory = table_memory };
+                    _ = verify_iterator;
+                    // FIXME: Finish
+                    // for (
+                    //     target[0 .. target_count - 1],
+                    //     target[1..target_count],
+                    // ) |*value, *value_next| {
+                    //     assert(key_from_value(value_next) > key_from_value(value));
+                    // }
+                }
+
+                return .{
+                    .table_memory = table_memory,
+                };
+            }
+
+            pub fn next(self: *Iterator) ?Table.Value {
+                const source = self.table_memory.values_used();
+                assert(source.len > 0);
+
+                var source_index: usize = self.source_index;
+
+                // The last value in a run of duplicates needs to be the one that ends up returned.
+                var candidate: ?Table.Value = blk: while (source_index < source.len) {
+                    // If we're at the end of the source, there is no next value, so the next value
+                    // can't be equal.
+                    const value_next_equal = source_index + 1 < source.len and
+                        key_from_value(&source[source_index]) ==
+                        key_from_value(&source[source_index + 1]);
+
+                    if (value_next_equal) {
+                        if (Table.usage == .secondary_index) {
+                            // Secondary index optimization --- cancel out put and remove.
+                            // NB: while this prevents redundant tombstones from getting to disk, we
+                            // still spend some extra CPU work to sort the entries in memory. Ideally,
+                            // we annihilate tombstones immediately, before sorting, but that's tricky
+                            // to do with scopes.
+                            assert(Table.tombstone(&source[source_index]) !=
+                                Table.tombstone(&source[source_index + 1]));
+                            source_index += 2;
+                        } else {
+                            // The last value in a run of duplicates needs to be the one that ends
+                            // up returned.
+                            source_index += 1;
+                        }
+                    } else {
+                        const val = source[source_index];
+                        source_index += 1;
+                        break :blk val;
+                    }
+                } else {
+                    break :blk null;
+                };
+
+                self.source_index = source_index;
+
+                std.log.info("Yielding: {?}", .{candidate});
+
+                return candidate;
+
+                // // At this point, source_index and target_index are actually counts.
+                // // source_index will always be incremented after the final iteration as part of the
+                // // continue expression.
+                // // target_index will always be incremented, since either source_index runs out first
+                // // so value_next_equal is false, or a new value is hit, which will increment it.
+                // const source_count = source_index;
+                // const target_count = target_index;
+
+                // std.log.info("Filled using {} vals", .{source_count});
+                // bar_context.table_info_a.immutable =
+                //     bar_context.table_info_a.immutable[source_count..];
+
+                // if (target_count == 0) {
+                //     assert(Table.usage == .secondary_index);
+                //     return 0;
+                // }
+
+                // assert(target_count > 0);
+                // return target_count;
+            }
+
+            pub fn count(self: *const Iterator) bool {
+                return self.table_memory.count();
+            }
+
+            pub fn remaining(self: *const Iterator) bool {
+                return self.source_index < self.table_memory.count();
+            }
+        };
+
         pub const ValueContext = struct {
             count: usize = 0,
             sorted: bool = true,
@@ -66,6 +176,10 @@ pub fn TableMemoryType(comptime Table: type) type {
                 .mutability = mutability,
                 .name = table.name,
             };
+        }
+
+        pub fn iterator(table: *TableMemory) Iterator {
+            return Iterator.init(table);
         }
 
         pub fn count(table: *const TableMemory) usize {

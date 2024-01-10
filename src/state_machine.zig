@@ -710,6 +710,9 @@ pub fn StateMachineType(
                 .state_machine_compact,
                 @src(),
             );
+            const stdout = std.io.getStdOut().writer();
+            const compaction_beat = op % config.lsm_batch_multiple;
+            stdout.print("\nState machine compact: op {} ({}/{})\n-----------------------------------------------\n", .{ op, compaction_beat, config.lsm_batch_multiple }) catch unreachable;
 
             self.compact_callback = callback;
             self.forest.compact(compact_finish, op);

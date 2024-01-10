@@ -68,6 +68,17 @@ pub const CompactionInfo = struct {
     value_count: usize,
 };
 
+pub const CompactionBlocks = struct {
+    /// FIXME: Input index blocks shared... Not sure of consequences yet.
+    input_index_blocks: []BlockPtr,
+
+    /// For each split, for each input level, we have a buffer of blocks.
+    input_data_blocks: [2][2][]BlockPtr,
+
+    /// For each split we have a buffer of blocks.
+    output_data_blocks: [2][]BlockPtr,
+};
+
 pub fn CompactionType(
     comptime Table: type,
     comptime Tree: type,
@@ -89,8 +100,10 @@ pub fn CompactionType(
         const key_from_value = Table.key_from_value;
         const tombstone = Table.tombstone;
 
+        const BlipCallback = *const fn (*anyopaque, ?bool) void;
+
         const TableInfoA = union(enum) {
-            immutable: []const Value,
+            immutable: Tree.TableMemory.Iterator,
             disk: TableInfoReference,
         };
 
@@ -104,27 +117,36 @@ pub fn CompactionType(
         // pipeline. We could split it more, but unsure if worth it. This whole structure would need to change.
         const PipelineStage = enum { read, cpu, write };
         const PipelineContext = struct {
-            read: struct {
+            const ReadContext = struct {
                 current_split: usize = 0,
                 active: bool = false,
-                callback: *const fn (*anyopaque, u64, u64) void = undefined,
-            } = .{},
-            cpu: struct {
+                callback: BlipCallback = undefined,
+                ptr: *anyopaque = undefined,
+                next_tick: Grid.NextTick = undefined,
+            };
+            const CPUContext = struct {
                 current_split: usize = 0,
                 active: bool = false,
-                callback: *const fn (*anyopaque, u64, u64) void = undefined,
+                callback: BlipCallback = undefined,
+                ptr: *anyopaque = undefined,
                 current_block_a: usize = 0,
                 current_block_b: usize = 0,
                 current_block_a_idx: usize = 0,
                 current_block_b_idx: usize = 0,
                 current_output_data_block: usize = 0,
-            } = .{},
-            write: struct {
+                next_tick: Grid.NextTick = undefined,
+            };
+            const WriteContext = struct {
                 current_split: usize = 0,
                 active: bool = false,
-                callback: *const fn (*anyopaque, u64, u64) void = undefined,
+                callback: BlipCallback = undefined,
+                ptr: *anyopaque = undefined,
                 data_blocks_count: usize = 0,
-            } = .{},
+                next_tick: Grid.NextTick = undefined,
+            };
+            read: ReadContext = .{},
+            cpu: CPUContext = .{},
+            write: WriteContext = .{},
 
             fn activate_and_assert(self: *PipelineContext, stage: PipelineStage) void {
                 switch (stage) {
@@ -237,19 +259,14 @@ pub fn CompactionType(
             }) = .{},
 
             table_builder: Table.Builder = .{},
-
-            /// FIXME: Used for callback :/
-            forest: *anyopaque,
         };
 
         const BeatContext = struct {
             grid_reservation: ?Grid.Reservation,
 
             // Index blocks don't have the same data dependency on cpu that data blocks do.
-            input_index_blocks: []BlockPtr,
-
-            input_data_blocks: [2][2][]BlockPtr,
-            output_data_blocks: [2][]BlockPtr,
+            // FIXME: undefined!
+            blocks: CompactionBlocks = undefined,
 
             grid_reads: []Grid.FatRead,
             grid_writes: []Grid.FatWrite,
@@ -274,9 +291,6 @@ pub fn CompactionType(
         // Populated by {bar,beat}_setup.
         bar_context: ?BarContext,
         beat_context: ?BeatContext,
-
-        // Used by our next tick helper.
-        // blip_next_tick: Grid.NextTick,
 
         pub fn init(tree_config: Tree.Config, grid: *Grid, level_b: u8) !Compaction {
             assert(level_b < constants.lsm_levels);
@@ -319,11 +333,11 @@ pub fn CompactionType(
         /// Returns null if there's no compaction work, otherwise returns the compaction work that needs to be done.
         /// move_table is a semi-special case - a non-null value is returned because we still need to do manifest
         /// updates in bar_finish, but we don't need to actually _do_ anything else.
-        pub fn bar_setup(compaction: *Compaction, tree: *Tree, op: u64, forest: *anyopaque) ?CompactionInfo {
+        pub fn bar_setup(compaction: *Compaction, tree: *Tree, op: u64) ?CompactionInfo {
             assert(compaction.bar_context == null);
             assert(compaction.beat_context == null);
 
-            std.log.info("bar_setup running for compaction: {s} into level: {}", .{ compaction.tree_config.name, compaction.level_b });
+            // std.log.info("bar_setup running for compaction: {s} into level: {}", .{ compaction.tree_config.name, compaction.level_b });
 
             // FIXME values_count vs value_count
             var total_value_count: usize = 0;
@@ -371,7 +385,7 @@ pub fn CompactionType(
                     .op_min = op,
 
                     .move_table = false,
-                    .table_info_a = .{ .immutable = tree.table_immutable.values_used() },
+                    .table_info_a = .{ .immutable = tree.table_immutable.iterator() },
                     .range_b = range_b,
                     .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
                         compaction.level_b,
@@ -382,9 +396,6 @@ pub fn CompactionType(
                     .output_index_blocks = undefined,
                     .beat_budget = null,
                     .beat_count = 0,
-
-                    // FIXME: Don't like this!
-                    .forest = forest,
                 };
             } else {
                 // Do not start compaction if level A does not require compaction.
@@ -430,16 +441,13 @@ pub fn CompactionType(
                     .output_index_blocks = undefined,
                     .beat_budget = null,
                     .beat_count = 0,
-
-                    // FIXME: Don't like this!
-                    .forest = forest,
                 };
             }
 
             assert(compaction.bar_context.?.drop_tombstones or compaction.level_b < constants.lsm_levels - 1);
 
             return .{
-                .value_count = 123,
+                .value_count = total_value_count,
             };
         }
 
@@ -469,80 +477,9 @@ pub fn CompactionType(
             compaction.bar_context.?.table_builder.set_index_block(output_index_blocks[0]);
         }
 
-        /// Our input and output blocks (excluding index blocks for now) are split two ways. First, equally by pipeline stage
-        /// then by table a / table b. FIXME: Currently the split by a / b is equal, but it shouldn't be for max performance.
-        /// -------------------------------------------------------------
-        /// | Pipeline 0                  | Pipeline 1                  |
-        /// | Table A     | Table B       | Table A     | Table B       |
-        /// -------------------------------------------------------------
-        /// FIXME: Here's a complicating factor: to ensure the jigsaw blocks line up nicely, this memory actually needs to be managed
-        /// by the forest.
-        /// Eg, once we've done our final write(1), we know we can use read(0) memory...
-        fn divide_blocks(compaction: *Compaction, blocks: []BlockPtr) struct {
-            input_index_blocks: []BlockPtr,
-            input_data_blocks: [2][2][]BlockPtr,
-            output_data_blocks: [2][]BlockPtr,
-        } {
-            _ = compaction;
-
-            var minimum_block_count: u64 = 0;
-            // We need a minimum of 2 input data blocks; one from each table.
-            minimum_block_count += 2;
-
-            // We need a minimum of 1 output data block.
-            minimum_block_count += 1;
-
-            // Because we're a 3 stage pipeline, with the middle stage (cpu) having a data dependency on both
-            // read and write data blocks, we need to split our memory in the middle. This results in a doubling of
-            // what we have so far.
-            // FIXME: perhaps read_data_block?? Hmmm input is clearer I think.
-            minimum_block_count *= 2;
-
-            // Lastly, reserve our input index blocks. For now, just require we have enough for all tables and pretend like
-            // pipelining this isn't a thing.
-            // FIXME: This shouldn't do that. The minimum is 2; but we don't really need to hold on to index blocks
-            // if we read the data blocks directly. TBC.
-            minimum_block_count += 9;
-
-            // FIXME: We can also calculate the optimum number of blocks. Old comment below:
-            // // Actually... All the comments below would be to do _all_ the work required. The max amount to do the work required
-            // // per beat would then be divided by beat. _however_ the minimums won't change!
-            // // Minimum of 2, max lsm_growth_factor+1. Replaces index_block_a and index_block_b too.
-            // // Output index blocks are explicitly handled in bar_setup_budget.
-            // input_index_blocks: []BlockPtr,
-            // // Minimum of 2, one from each table. Max would be max possible data blocks in lsm_growth_factor+1 tables.
-            // input_data_blocks: []BlockPtr,
-            // // Minimum of 1, max would be max possible data blocks in lsm_growth_factor+1 tables.
-            // output_data_blocks: []BlockPtr,
-
-            assert(blocks.len >= minimum_block_count);
-
-            const input_index_blocks = blocks[0..9];
-
-            const input_data_pipeline_0_level_a = blocks[9..][0..1];
-            const input_data_pipeline_0_level_b = blocks[10..][0..1];
-            const input_data_pipeline_1_level_a = blocks[11..][0..1];
-            const input_data_pipeline_1_level_b = blocks[12..][0..1];
-
-            const output_data_pipeline_0 = blocks[13..][0..1];
-            const output_data_pipeline_1 = blocks[14..][0..1];
-
-            const input_data_blocks = .{ .{ input_data_pipeline_0_level_a, input_data_pipeline_0_level_b }, .{ input_data_pipeline_1_level_a, input_data_pipeline_1_level_b } };
-            const output_data_blocks = .{ output_data_pipeline_0, output_data_pipeline_1 };
-
-            return .{
-                .input_index_blocks = input_index_blocks,
-                .input_data_blocks = input_data_blocks,
-                .output_data_blocks = output_data_blocks,
-            };
-        }
-
         /// Called per beat
-        pub fn beat_setup(
+        pub fn beat_grid_acquire(
             compaction: *Compaction,
-            blocks: []BlockPtr,
-            grid_reads: []Grid.FatRead,
-            grid_writes: []Grid.FatWrite,
         ) void {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context == null);
@@ -550,10 +487,6 @@ pub fn CompactionType(
             const bar_context = &compaction.bar_context.?;
             assert(bar_context.beat_budget != null and bar_context.beat_budget.? > 0);
             const beat_budget = bar_context.beat_budget.?;
-
-            // FIXME: Not sure best way to handle this. Blocks are identical for r/w but read / writes arent'.
-            assert(blocks.len <= grid_reads.len);
-            assert(bar_context.output_index_blocks.len + blocks.len <= grid_writes.len);
 
             // If we're move_table, the calling code should ensure beat_setup and blip code are never called.
             assert(!bar_context.move_table);
@@ -580,32 +513,57 @@ pub fn CompactionType(
             // (actually, we want to still panic but with something nicer like vsr.fail)
             const grid_reservation = compaction.grid.reserve(grid_blocks_per_beat).?;
 
-            const divided_blocks = compaction.divide_blocks(blocks);
+            // FIXME: MASSIVE HACK!!
+            if (compaction.bar_context.?.table_builder.state == .no_blocks) {
+                compaction.bar_context.?.table_builder.set_index_block(compaction.bar_context.?.output_index_blocks[0]);
+            }
 
             compaction.beat_context = .{
                 .grid_reservation = grid_reservation,
-
-                .input_index_blocks = divided_blocks.input_index_blocks,
-                .input_data_blocks = divided_blocks.input_data_blocks,
-                .output_data_blocks = divided_blocks.output_data_blocks,
-
-                .grid_reads = grid_reads,
-                .grid_writes = grid_writes,
+                .grid_reads = undefined,
+                .grid_writes = undefined,
             };
-
-            // FIXME NB REMOVE!
-            // bar_context.table_builder.set_data_block(divided_blocks.output_data_blocks[0][0]);
         }
 
-        // Our blip pipeline is 3 stages long, and split into read(), cpu() and write(). Within a single compaction,
+        pub fn beat_blocks_assign(compaction: *Compaction, blocks: CompactionBlocks, grid_reads: []Grid.FatRead, grid_writes: []Grid.FatWrite) void {
+            assert(compaction.bar_context != null);
+            assert(compaction.beat_context != null);
+
+            const beat_context = &compaction.beat_context.?;
+            const bar_context = &compaction.bar_context.?;
+
+            beat_context.grid_reads = grid_reads;
+            beat_context.grid_writes = grid_writes;
+            beat_context.blocks = blocks;
+
+            // FIXME: Not sure best way to handle this. Blocks are identical for r/w but read / writes arent'.
+            assert(
+                blocks.input_index_blocks.len + blocks.input_data_blocks[0][0].len + blocks.input_data_blocks[0][1].len + blocks.input_data_blocks[1][0].len + blocks.input_data_blocks[1][1].len <= grid_reads.len,
+            );
+            assert(bar_context.output_index_blocks.len + blocks.output_data_blocks[0].len + blocks.output_data_blocks[1].len <= grid_writes.len);
+
+            // FIXME: This sets the initial data block...
+            bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[0][0]);
+        }
+
+        // Our blip pipeline is 3 stages long, and split into Read, Cpu and Write. Within a single compaction,
         // the pipeline looks something like:
         // ---------------------------------------------------------------------------------------------------------
-        // | read(0)    | cpu(0)     | write(0)   | read(1)    | cpu(1)     | write(1)   |            |            |
+        // | Ra₀    | Ca₀     | Wa₀     | Ra₁     | Rb₁     | Cb₁     | Wb₁           |            |
         // ---------------------------------------------------------------------------------------------------------
-        // |            | read(1)    | cpu(1)     | write(1)   | read(0)    | cpu(0)     | write(0)   |            |
+        // |       | Ra₁     | Ca₁     | Wa₁     | ---      | Rb₀     | Cb₀           | Wb₀           |
         // ---------------------------------------------------------------------------------------------------------
-        // |            |            | read(0)    | cpu(0)     | write(0)   | read(1)    | cpu(1)     | write(1)   |
+        // |       |        | Ra₀     | Ca₀ → E | Wb₀       | ---     | Rb₁           |  Cb₁          | Wb₁
         // ---------------------------------------------------------------------------------------------------------
+        //
+        // ---------------------------------------------------------------------------------------------------------
+        // | Ra₀    | Ca₀     | Wa₀     | Ra₁     | Ca₁     | Wa₁     | Rb₀           |            |
+        // ---------------------------------------------------------------------------------------------------------
+        // |       | Ra₁     | Ca₁     | Wa₁     | Rb₀      | Cb₀     | Wb₀           |             |
+        // ---------------------------------------------------------------------------------------------------------
+        // |       |        | Ra₀     | Ca₀ → E | Wb₀       | Rb₁     | Cb₁           |  Wb₁
+        // ---------------------------------------------------------------------------------------------------------
+
         // Internally, we have a reentry (better name?) counter - the first time read() is called, it works on buffer set 0, the next
         // time on buffer set 1. Ditto for cpu and write.
         // read(0) means read into read buffer set 0, cpu(0) means cpu merge from read buffer set 0 to write buffer set 0,
@@ -630,7 +588,7 @@ pub fn CompactionType(
         /// FIXME: If we treated our buffers as circular, we could be more efficient when doing our reads: rather than just read for
         /// eg one side if we're exhausted, we could read for both...
         /// HOWEVER! This isn't needed to be correct.
-        pub fn blip_read(compaction: *Compaction, callback: *const fn (*anyopaque, u64, u64) void) void {
+        pub fn blip_read(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             // FIXME: Is there a point to asserting != null if we use .? later?
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
@@ -641,11 +599,11 @@ pub fn CompactionType(
 
             beat_context.pipeline_context.activate_and_assert(.read);
 
-            // Short circuit our callback if we have no reads to do. We'll always next_tick on write,
-            // so no risk of stack overflow here.
-            // Although maybe its more consistent to not?
-            beat_context.pipeline_context.deactivate_and_assert(.read);
-            callback(compaction.bar_context.?.forest, compaction.tree_config.id, compaction.level_b);
+            // FIXME: Move these to activate and assert?
+            beat_context.pipeline_context.read.callback = callback;
+            beat_context.pipeline_context.read.ptr = ptr;
+
+            compaction.grid.on_next_tick(blip_read_next_tick, &beat_context.pipeline_context.read.next_tick);
 
             // callback:  void
             // FIXME: Verify the value count matches the number of values we actually compact.
@@ -746,64 +704,64 @@ pub fn CompactionType(
             beat_context.pipeline_context.deactivate_and_assert(.read);
         }
 
-        /// Checks our input blocks and determines if we have enough input to create a full output block.
-        fn enough_input_for_a_full_output_block(compaction: *Compaction) enum { incomplete, possible, complete } {
-            // There are 3 cases:
-            // 1. Incomplete. We simply don't have enough values left in our input buffers to create a full output block,
-            //    no matter how they align.
-            // 2. Possible. Maybe, depending on the number of tombstones and how they cancel, we might have a full output
-            //    block
-            // 3. Complete. We have enough values that even in the complete worst cast, we can generate a full output block.
-            _ = compaction;
+        fn blip_read_next_tick(next_tick: *Grid.NextTick) void {
+            const read_pipeline_context = @fieldParentPtr(PipelineContext.ReadContext, "next_tick", next_tick);
+            const pipeline_context = @fieldParentPtr(PipelineContext, "read", read_pipeline_context);
+            const beat_context = @fieldParentPtr(BeatContext, "pipeline_context", pipeline_context);
+            // const beat_context: *?BeatContext = @ptrCast(@fieldParentPtr(BeatContext, "pipeline_context", pipeline_context));
+            // const compaction = @fieldParentPtr(Compaction, "beat_context", beat_context);
+            // _ = compaction;
+
+            const callback = read_pipeline_context.callback;
+            const ptr = read_pipeline_context.ptr;
+
+            // So this makes callback / ptr null :/
+            beat_context.pipeline_context.deactivate_and_assert(.read);
+
+            callback(ptr, null);
         }
 
-        fn calculate_values_in(compaction: *Compaction) union(enum) { values_in: [2][]const Value, need_read } {
+        fn calculate_values_in(compaction: *Compaction) union(enum) {
+            values_in: [2][]const Value,
+            values_in_b: []const Value,
+            need_read,
+        } {
             assert(compaction.beat_context != null);
             const beat_context = &compaction.beat_context.?;
             const cpu = &beat_context.pipeline_context.cpu;
 
-            const blocks_a = beat_context.input_data_blocks[cpu.current_split][0];
-            const blocks_b = beat_context.input_data_blocks[cpu.current_split][1];
+            const blocks_a = beat_context.blocks.input_data_blocks[cpu.current_split][0];
+            const blocks_b = beat_context.blocks.input_data_blocks[cpu.current_split][1];
             _ = blocks_b;
-
-            // FIXME: Assert we're not exhausted.
-
-            const values_a = switch (compaction.bar_context.?.table_info_a) {
-                .immutable => blk: {
-                    const values = Table.data_block_values(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..];
-
-                    // FIXME: Make fill_immutable_values work with the consumption logic :/
-                    log.info("{s}: starting fill", .{compaction.tree_config.name});
-                    const count = compaction.fill_immutable_values(values);
-                    log.info("{s}: Filled {} values", .{ compaction.tree_config.name, count });
-
-                    break :blk values[0..count];
-                },
-                .disk => Table.data_block_values_used(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..],
-            };
 
             // FIXME: TODO handle when we have b tables lol
             // const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
             const values_b = &.{};
-            return .{ .values_in = .{ values_a, values_b } };
+
+            // FIXME: Assert we're not exhausted.
+            switch (compaction.bar_context.?.table_info_a) {
+                .immutable => {
+                    // Don't return compaction.bar_context.?.table_info_a - the caller can use it directly rather.
+                    return .{ .values_in_b = values_b };
+                },
+                .disk => {
+                    const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..];
+                    return .{ .values_in = .{ values_a, values_b } };
+                },
+            }
         }
 
         /// Perform CPU merge work, to transform our input tables to our output tables.
         /// This has a data dependency on both the read buffers and the write buffers for the current
         /// split.
         ///
-        /// FIXME: Use a callback, so we can easily offload this to a threadpool in future.
-        // A blip is over when one of the following condition are met:
+        // A blip is over when one of the following condition are met, considering we don't want to output partial data blocks unless we really really have to:
         // * We have no more input remaining, at all - the bar is done. This will likely result in a partially full data block.
         // * We have no more output data blocks remaining - we might need more blips, but that's up to the forest to orchestrate.
         // * We have no more output index blocks remaining - we might have a partial data block here, but that's OK.
-        // * We have no more input blocks remaining; this is a more challenging case:
-        //   * We don't want to output partial data blocks unless we really really have to. So, we actually start looking at this case before we run out of
-        //     input blocks. If:
-        //     * Table A is empty: the amount of values we have less is purly based on table b value count. If > data block value count, process them.
-        //     * Table B is not empty: the amount of values could be anything between table a cancelling all table b, and table a + table b. Figure out
-        //       a hueristic. If we create a partially empty data block, perhaps keep it if above some fill factor? otherwise delete and we'll have to redo the work later.
-        pub fn blip_cpu(compaction: *Compaction) void {
+        // * We have no more input blocks remaining:
+        //   * FIXME: Flesh out the cases here
+        pub fn blip_cpu(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -812,23 +770,85 @@ pub fn CompactionType(
 
             beat_context.pipeline_context.activate_and_assert(.cpu);
 
+            // .immutable_values_in => || {
+            //     var ivi = immutable_values_in[0];
+            //     var values_b = immutable_values_in[1];
+
+            //     while (ivi.remaining() or values_b.len > 0) {
+            //         // FIXME: Can optimize this later by swapping to copy if immutable iterator is empty.
+            //         // if (values_in[0].len == 0) {
+            //         //     copy(&bar_context.table_builder, &values_in, .b);
+            //         if (!ivi.remaining()) {
+            //             copy(&bar_context.table_builder, &values_in, .b);
+            //         } else if (values_b.len == 0) {
+            //             if (bar_context.drop_tombstones) {
+            //                 copy_drop_tombstones(&bar_context.table_builder, &values_in);
+            //             } else {
+            //                 copy(&bar_context.table_builder, &values_in, .a);
+            //             }
+            //         } else {
+            //             merge_immutable(
+            //                 &bar_context.table_builder,
+            //                 ivi,
+            //                 &values_b,
+            //                 bar_context.drop_tombstones,
+            //             );
+            //         }
+
+            //         // std.log.info("Just merged immutable: remaining {} values_b: {}", .{ ivi.remaining(), values_b.len });
+
+            //         // When checking if we're done, there are two things we need to consider:
+            //         // 1. Have we finished our input entirely? If so, we flush what we have - it'll be a partial block but that's OK.
+            //         // 2. Have we reached our value_count_goal? If os, we'll flush at the next complete data block.
+            //         //
+            //         // This means that we'll potentially overrun our value_count_goal by up to a full data block.
+            //         const fully_exhausted = true;
+
+            //         switch (compaction.check_and_finish_blocks(.{ .index_block = fully_exhausted, .data_block = fully_exhausted })) {
+            //             // We might still have input values, even if an output block is full etc.
+            //             .cpu_finished => continue,
+
+            //             .cpu_unfinished => continue,
+
+            //             // If we have to write, we need to break out of the outer loop.
+            //             .need_write => {
+            //                 // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
+            //                 beat_context.pipeline_context.write.data_blocks_count = beat_context.pipeline_context.cpu.current_output_data_block;
+            //                 break :outer;
+            //             },
+            //         }
+            //     }
+            //     return;
+            // },
+
             // FIXME: No while true loops!
             outer: while (true) {
                 assert(bar_context.table_builder.value_count < Table.layout.block_value_count_max);
 
-                var values_in = switch (compaction.calculate_values_in()) {
-                    .values_in => |values_in| values_in,
-                    .need_read => {
-                        // FIXME: TODO
-                        return;
-                    },
+                var values_in = compaction.calculate_values_in();
+                if (values_in == .need_read) {
+                    // FIXME: Assert that we never need_read on our first iteration.
+                    // FIXME: TODO
+                    return;
+                }
+
+                const values_in_a_len = switch (values_in) {
+                    .values_in => |v| v[0].len,
+                    .values_in_b => compaction.table_info_a.immutable.count(),
+                    .need_read => unreachable,
+                };
+                const values_in_b_len = switch (values_in) {
+                    .values_in => |v| v[1].len,
+                    .values_in_b => |v| v.len,
+                    .need_read => unreachable,
                 };
 
+                std.log.info("Running blip_cpu loop: {} and {}", .{ values_in_a_len, values_in_b_len });
+
                 // We are responsible for not blipping again if all work is done.
-                assert(values_in[0].len > 0 or values_in[1].len > 0);
+                assert(values_in_a_len > 0 or values_in_b_len > 0);
 
                 // Loop through the CPU work until we have nothing left.
-                // FIXME: and not or? - also actually loop thru blocks
                 while (values_in[0].len > 0 or values_in[1].len > 0) {
                     if (values_in[0].len == 0) {
                         copy(&bar_context.table_builder, &values_in, .b);
@@ -842,14 +862,18 @@ pub fn CompactionType(
                         merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
                     }
 
-                    // FIXME: Some magic to calculate if we've exhausted _all_ of our input values
-                    // Need to consider how to handle the splitting by beat here VS completely exhausted. When we're
-                    // completely exhausted we write out our blocks etc as is, but if we're only partially done it's complex.
-                    const exhausted = true;
+                    // When checking if we're done, there are two things we need to consider:
+                    // 1. Have we finished our input entirely? If so, we flush what we have - it'll be a partial block but that's OK.
+                    // 2. Have we reached our value_count_goal? If so, we'll flush at the next complete data block.
+                    //
+                    // This means that we'll potentially overrun our value_count_goal by up to a full data block.
+                    const fully_exhausted = true;
 
-                    switch (compaction.check_and_finish_blocks(exhausted)) {
+                    switch (compaction.check_and_finish_blocks(.{ .index_block = fully_exhausted, .data_block = fully_exhausted })) {
                         // We might still have input values, even if an output block is full etc.
-                        .cpu => continue,
+                        .cpu_finished => continue,
+
+                        .cpu_unfinished => continue,
 
                         // If we have to write, we need to break out of the outer loop.
                         .need_write => {
@@ -862,10 +886,15 @@ pub fn CompactionType(
             }
 
             beat_context.pipeline_context.deactivate_and_assert(.cpu);
+
+            // FIXME: Move these to activate and assert?
+            beat_context.pipeline_context.cpu.callback = callback;
+            beat_context.pipeline_context.cpu.ptr = ptr;
+            callback(ptr, true);
         }
 
         // FIXME: Make input_exhausted a struct rather
-        fn check_and_finish_blocks(compaction: *Compaction, input_exhausted: bool) enum { cpu, need_write } {
+        fn check_and_finish_blocks(compaction: *Compaction, force_flush: struct { index_block: bool, data_block: bool }) enum { cpu_unfinished, cpu_finished, need_write } {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -875,17 +904,20 @@ pub fn CompactionType(
 
             assert(cpu.active);
 
+            // If the index block is force flushed, the data block must be too.
+            assert(!force_flush.index_block or force_flush.data_block);
+
             const table_builder = &bar_context.table_builder;
 
             // FIXME: For now we don't distinguish between needing index / data writes; we just write whatever
             // we can, based on the _completed_count fields.
             var need_write = false;
+            var finished_data_block = false;
 
             // Flush the data block if needed.
             if (table_builder.data_block_full() or
                 table_builder.index_block_full() or
-                // If the input is exhausted then we need to flush all blocks before finishing.
-                (input_exhausted and !table_builder.data_block_empty()))
+                (force_flush.data_block and !table_builder.data_block_empty()))
             {
                 table_builder.data_block_finish(.{
                     .cluster = compaction.grid.superblock.working.cluster,
@@ -893,19 +925,21 @@ pub fn CompactionType(
                     .snapshot_min = snapshot_min_for_table_output(bar_context.op_min),
                     .tree_id = compaction.tree_config.id,
                 });
+                std.log.info("Finished data block", .{});
 
                 cpu.current_output_data_block += 1;
-                if (cpu.current_output_data_block == beat_context.output_data_blocks[cpu.current_split].len) {
+                finished_data_block = true;
+                if (cpu.current_output_data_block == beat_context.blocks.output_data_blocks[cpu.current_split].len) {
                     need_write = true;
                 } else {
-                    table_builder.set_data_block(beat_context.output_data_blocks[cpu.current_split][cpu.current_output_data_block]);
+                    table_builder.set_data_block(beat_context.blocks.output_data_blocks[cpu.current_split][cpu.current_output_data_block]);
                 }
             }
 
             // Flush the index block if needed.
             if (table_builder.index_block_full() or
                 // If the input is exhausted then we need to flush all blocks before finishing.
-                (input_exhausted and !table_builder.index_block_empty()))
+                (force_flush.index_block and !table_builder.index_block_empty()))
             {
                 const table = table_builder.index_block_finish(.{
                     .cluster = compaction.grid.superblock.working.cluster,
@@ -913,6 +947,7 @@ pub fn CompactionType(
                     .snapshot_min = snapshot_min_for_table_output(bar_context.op_min),
                     .tree_id = compaction.tree_config.id,
                 });
+                std.log.info("Finished index block", .{});
 
                 // FIXME: Write pipelining and the bar global index block situation.
                 bar_context.current_index_block += 1;
@@ -929,18 +964,14 @@ pub fn CompactionType(
                 });
             }
 
-            // FIXME: Check if we've reached our target values when we have a full block?
-            if (input_exhausted) {
-                assert(need_write == true);
-            }
-
             if (need_write) return .need_write;
+            if (finished_data_block) return .cpu_finished;
 
-            return .cpu;
+            return .cpu_unfinished;
         }
 
         /// Perform write IO to write our output_index_blocks and output_data_blocks to disk.
-        pub fn blip_write(compaction: *Compaction) void {
+        pub fn blip_write(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             // FIXME: Is there a point to asserting != null if we use .? later?
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
@@ -952,15 +983,19 @@ pub fn CompactionType(
 
             beat_context.pipeline_context.activate_and_assert(.write);
 
+            // FIXME: Move these to activate and assert?
+            beat_context.pipeline_context.write.callback = callback;
+            beat_context.pipeline_context.write.ptr = ptr;
+
             // Write any complete index blocks.
             // FIXME: The interaction of this is painful.
-            // for (beat_context.output_data_blocks[write.current_split][], 0..) |block, i| {
+            // for (beat_context.blocks.output_data_blocks[write.current_split][], 0..) |block, i| {
             //     compaction.state.tables_writing.pending += 1;
             //     compaction.grid.create_block(blip_write_callback, write, block);
             // }
 
             // Write any complete data blocks.
-            for (beat_context.output_data_blocks[write.current_split], 0..write.data_blocks_count) |*block, i| {
+            for (beat_context.blocks.output_data_blocks[write.current_split], 0..write.data_blocks_count) |*block, i| {
                 std.log.info("Issuing a write for split {} block {}", .{ write.current_split, i });
                 beat_context.grid_writes[i].target = compaction;
                 beat_context.pending_writes += 1;
@@ -997,20 +1032,17 @@ pub fn CompactionType(
 
             if (beat_context.pending_writes == 0) {
                 std.log.info("all writes done! callback time!!", .{});
+                const callback = beat_context.pipeline_context.write.callback;
+                const ptr = beat_context.pipeline_context.write.ptr;
+
+                // FIXME: This style is gross! deactivate_and_assert clears the callback / ptr.
+                beat_context.pipeline_context.deactivate_and_assert(.write);
+                callback(ptr, null);
                 // compaction.write_finish();
             }
         }
 
-        fn blip_on_next_tick(next_tick: *Grid.NextTick) void {
-            _ = next_tick;
-            // const compaction = @fieldParentPtr(Compaction, "blip_next_tick", next_tick);
-            // assert(compaction.state == .next_tick);
-
-            // compaction.state = .compacting;
-            // compaction.loop_start();
-        }
-
-        pub fn beat_finish(compaction: *Compaction) void {
+        pub fn beat_grid_forfeit(compaction: *Compaction) void {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -1018,7 +1050,7 @@ pub fn CompactionType(
 
             beat_context.pipeline_context.assert_all_inactive();
             assert(compaction.bar_context.?.table_builder.data_block_empty());
-            assert(compaction.bar_context.?.table_builder.state == .index_block); // Hmmm
+            // assert(compaction.bar_context.?.table_builder.state == .index_block); // Hmmm
             assert(beat_context.pending_index_reads == 0);
             assert(beat_context.pending_data_reads == 0);
             assert(beat_context.pending_writes == 0);
@@ -1032,7 +1064,7 @@ pub fn CompactionType(
             }
 
             // FIXME: Hack, real compaction will need to set this obvs
-            std.log.info("WTF: {}", .{compaction.bar_context.?.tree.table_immutable.mutability.immutable.flushed});
+            // std.log.info("WTF: {}", .{compaction.bar_context.?.tree.table_immutable.mutability.immutable.flushed});
             compaction.bar_context.?.tree.table_immutable.mutability.immutable.flushed = true;
 
             compaction.bar_context.?.beat_count += 1;
@@ -1131,95 +1163,6 @@ pub fn CompactionType(
                 .operation = .move_to_level_b,
                 .table = table_a.*,
             });
-        }
-
-        /// Copies values to `target` from our immutable table input. In the process, merge values
-        /// with identical keys (last one wins) and collapse tombstones for secondary indexes.
-        /// Return the number of values written to the output and updates immutable table slice to
-        /// the non-processed remainder.
-        fn fill_immutable_values(compaction: *Compaction, target: []Value) usize {
-            const bar_context = &compaction.bar_context.?;
-            var source = bar_context.table_info_a.immutable;
-            assert(source.len > 0);
-
-            if (constants.verify) {
-                // The input may have duplicate keys (last one wins), but keys must be
-                // non-decreasing.
-                // A source length of 1 is always non-decreasing.
-                for (source[0 .. source.len - 1], source[1..source.len]) |*value, *value_next| {
-                    assert(key_from_value(value) <= key_from_value(value_next));
-                }
-            }
-
-            var source_index: usize = 0;
-            var target_index: usize = 0;
-            while (target_index < target.len and source_index < source.len) {
-                // The last value in a run of duplicates needs to be the one that ends up in
-                // target.
-                // std.log.info("Fill loop: {} to target len: {} source len: {}", .{ source[source_index], target.len, source.len });
-                target[target_index] = source[source_index];
-
-                // If we're at the end of the source, there is no next value, so the next value
-                // can't be equal.
-                const value_next_equal = source_index + 1 < source.len and
-                    key_from_value(&source[source_index]) ==
-                    key_from_value(&source[source_index + 1]);
-
-                if (value_next_equal) {
-                    if (Table.usage == .secondary_index) {
-                        // Secondary index optimization --- cancel out put and remove.
-                        // NB: while this prevents redundant tombstones from getting to disk, we
-                        // still spend some extra CPU work to sort the entries in memory. Ideally,
-                        // we annihilate tombstones immediately, before sorting, but that's tricky
-                        // to do with scopes.
-                        assert(tombstone(&source[source_index]) !=
-                            tombstone(&source[source_index + 1]));
-                        source_index += 2;
-                        target_index += 0;
-                    } else {
-                        // The last value in a run of duplicates needs to be the one that ends up in
-                        // target.
-                        source_index += 1;
-                        target_index += 0;
-                    }
-                } else {
-                    source_index += 1;
-                    target_index += 1;
-                }
-            }
-
-            // At this point, source_index and target_index are actually counts.
-            // source_index will always be incremented after the final iteration as part of the
-            // continue expression.
-            // target_index will always be incremented, since either source_index runs out first
-            // so value_next_equal is false, or a new value is hit, which will increment it.
-            const source_count = source_index;
-            const target_count = target_index;
-
-            assert(target_count <= source_count);
-
-            std.log.info("Filled using {} vals", .{source_count});
-            bar_context.table_info_a.immutable =
-                bar_context.table_info_a.immutable[source_count..];
-
-            if (target_count == 0) {
-                assert(Table.usage == .secondary_index);
-                return 0;
-            }
-
-            if (constants.verify) {
-                // Our output must be strictly increasing.
-                // An output length of 1 is always strictly increasing.
-                for (
-                    target[0 .. target_count - 1],
-                    target[1..target_count],
-                ) |*value, *value_next| {
-                    assert(key_from_value(value_next) > key_from_value(value));
-                }
-            }
-
-            assert(target_count > 0);
-            return target_count;
         }
 
         // TODO: Support for LSM snapshots would require us to only remove blocks

@@ -289,7 +289,7 @@ pub fn TableType(
             }
 
             pub fn data_block_empty(builder: *const Builder) bool {
-                assert(builder.state != .no_blocks);
+                stdx.maybe(builder.state == .no_blocks);
                 assert(builder.value_count <= data.value_count_max);
                 return builder.value_count == 0;
             }
@@ -394,7 +394,7 @@ pub fn TableType(
             }
 
             pub fn index_block_empty(builder: *const Builder) bool {
-                stdx.maybe(builder.state == .index_block);
+                stdx.maybe(builder.state == .no_blocks);
                 assert(builder.data_block_count <= data_block_count_max);
                 return builder.data_block_count == 0;
             }
