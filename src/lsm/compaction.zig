@@ -112,6 +112,12 @@ pub fn CompactionType(
             b,
         };
 
+        const ValuesInUnion = union(enum) {
+            values_in: [2][]const Value,
+            values_in_b: struct { *Tree.TableMemory.Iterator, []const Value },
+            need_read,
+        };
+
         // FIXME: Think about how we can assert we're getting called in the right order...
         // Since cpu() has data dependencies on both read() and write() memory, we have to split it in half (minimum) to get a working
         // pipeline. We could split it more, but unsure if worth it. This whole structure would need to change.
@@ -142,6 +148,7 @@ pub fn CompactionType(
                 callback: BlipCallback = undefined,
                 ptr: *anyopaque = undefined,
                 data_blocks_count: usize = 0,
+                set_next_data_block: bool = false,
                 next_tick: Grid.NextTick = undefined,
             };
             read: ReadContext = .{},
@@ -721,11 +728,7 @@ pub fn CompactionType(
             callback(ptr, null);
         }
 
-        fn calculate_values_in(compaction: *Compaction) union(enum) {
-            values_in: [2][]const Value,
-            values_in_b: []const Value,
-            need_read,
-        } {
+        fn calculate_values_in(compaction: *Compaction) ValuesInUnion {
             assert(compaction.beat_context != null);
             const beat_context = &compaction.beat_context.?;
             const cpu = &beat_context.pipeline_context.cpu;
@@ -741,8 +744,7 @@ pub fn CompactionType(
             // FIXME: Assert we're not exhausted.
             switch (compaction.bar_context.?.table_info_a) {
                 .immutable => {
-                    // Don't return compaction.bar_context.?.table_info_a - the caller can use it directly rather.
-                    return .{ .values_in_b = values_b };
+                    return .{ .values_in_b = .{ &compaction.bar_context.?.table_info_a.immutable, values_b } };
                 },
                 .disk => {
                     const values_a = Table.data_block_values_used(blocks_a[cpu.current_block_a])[cpu.current_block_a_idx..];
@@ -770,56 +772,13 @@ pub fn CompactionType(
 
             beat_context.pipeline_context.activate_and_assert(.cpu);
 
-            // .immutable_values_in => || {
-            //     var ivi = immutable_values_in[0];
-            //     var values_b = immutable_values_in[1];
+            const CPUFns = struct {
+                copy: *const fn (*Table.Builder, *ValuesInUnion, InputLevel) void,
+                copy_drop_tombstones: *const fn (*Table.Builder, *ValuesInUnion) void,
+                merge: *const fn (*Table.Builder, *ValuesInUnion, bool) void,
+            };
 
-            //     while (ivi.remaining() or values_b.len > 0) {
-            //         // FIXME: Can optimize this later by swapping to copy if immutable iterator is empty.
-            //         // if (values_in[0].len == 0) {
-            //         //     copy(&bar_context.table_builder, &values_in, .b);
-            //         if (!ivi.remaining()) {
-            //             copy(&bar_context.table_builder, &values_in, .b);
-            //         } else if (values_b.len == 0) {
-            //             if (bar_context.drop_tombstones) {
-            //                 copy_drop_tombstones(&bar_context.table_builder, &values_in);
-            //             } else {
-            //                 copy(&bar_context.table_builder, &values_in, .a);
-            //             }
-            //         } else {
-            //             merge_immutable(
-            //                 &bar_context.table_builder,
-            //                 ivi,
-            //                 &values_b,
-            //                 bar_context.drop_tombstones,
-            //             );
-            //         }
-
-            //         // std.log.info("Just merged immutable: remaining {} values_b: {}", .{ ivi.remaining(), values_b.len });
-
-            //         // When checking if we're done, there are two things we need to consider:
-            //         // 1. Have we finished our input entirely? If so, we flush what we have - it'll be a partial block but that's OK.
-            //         // 2. Have we reached our value_count_goal? If os, we'll flush at the next complete data block.
-            //         //
-            //         // This means that we'll potentially overrun our value_count_goal by up to a full data block.
-            //         const fully_exhausted = true;
-
-            //         switch (compaction.check_and_finish_blocks(.{ .index_block = fully_exhausted, .data_block = fully_exhausted })) {
-            //             // We might still have input values, even if an output block is full etc.
-            //             .cpu_finished => continue,
-
-            //             .cpu_unfinished => continue,
-
-            //             // If we have to write, we need to break out of the outer loop.
-            //             .need_write => {
-            //                 // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
-            //                 beat_context.pipeline_context.write.data_blocks_count = beat_context.pipeline_context.cpu.current_output_data_block;
-            //                 break :outer;
-            //             },
-            //         }
-            //     }
-            //     return;
-            // },
+            var move_to_next_compaction = true;
 
             // FIXME: No while true loops!
             outer: while (true) {
@@ -832,53 +791,78 @@ pub fn CompactionType(
                     return;
                 }
 
-                const values_in_a_len = switch (values_in) {
+                var values_in_a_len = switch (values_in) {
                     .values_in => |v| v[0].len,
-                    .values_in_b => compaction.table_info_a.immutable.count(),
+                    .values_in_b => |v| v[0].remaining(),
                     .need_read => unreachable,
                 };
-                const values_in_b_len = switch (values_in) {
+                var values_in_b_len = switch (values_in) {
                     .values_in => |v| v[1].len,
-                    .values_in_b => |v| v.len,
+                    .values_in_b => |v| v[1].len,
                     .need_read => unreachable,
                 };
 
-                std.log.info("Running blip_cpu loop: {} and {}", .{ values_in_a_len, values_in_b_len });
+                const cpu_fns: CPUFns = switch (values_in) {
+                    .values_in => .{ .copy = copy, .copy_drop_tombstones = copy_drop_tombstones, .merge = merge },
+                    .values_in_b => .{ .copy = copy_iterator, .copy_drop_tombstones = copy_drop_tombstones_iterator, .merge = merge_iterator },
+                    .need_read => unreachable,
+                };
 
-                // We are responsible for not blipping again if all work is done.
+                std.log.info("Pre blip_cpu loop: {} and {}", .{ values_in_a_len, values_in_b_len });
+
+                // We are responsible for not iterating again if all work is done.
                 assert(values_in_a_len > 0 or values_in_b_len > 0);
 
                 // Loop through the CPU work until we have nothing left.
-                while (values_in[0].len > 0 or values_in[1].len > 0) {
-                    if (values_in[0].len == 0) {
-                        copy(&bar_context.table_builder, &values_in, .b);
-                    } else if (values_in[1].len == 0) {
+                while (values_in_a_len > 0 or values_in_b_len > 0) {
+                    std.log.info("Mid blip_cpu loop: {} and {}", .{ values_in_a_len, values_in_b_len });
+                    if (values_in_a_len == 0) {
+                        cpu_fns.copy(&bar_context.table_builder, &values_in, .b);
+                    } else if (values_in_b_len == 0) {
                         if (bar_context.drop_tombstones) {
-                            copy_drop_tombstones(&bar_context.table_builder, &values_in);
+                            cpu_fns.copy_drop_tombstones(&bar_context.table_builder, &values_in);
                         } else {
-                            copy(&bar_context.table_builder, &values_in, .a);
+                            cpu_fns.copy(&bar_context.table_builder, &values_in, .a);
                         }
                     } else {
-                        merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
+                        cpu_fns.merge(&bar_context.table_builder, &values_in, bar_context.drop_tombstones);
                     }
+
+                    // FIXME: Update these in a nicer way...
+                    values_in_a_len = switch (values_in) {
+                        .values_in => |v| v[0].len,
+                        .values_in_b => |v| v[0].remaining(),
+                        .need_read => unreachable,
+                    };
+                    values_in_b_len = switch (values_in) {
+                        .values_in => |v| v[1].len,
+                        .values_in_b => |v| v[1].len,
+                        .need_read => unreachable,
+                    };
 
                     // When checking if we're done, there are two things we need to consider:
                     // 1. Have we finished our input entirely? If so, we flush what we have - it'll be a partial block but that's OK.
                     // 2. Have we reached our value_count_goal? If so, we'll flush at the next complete data block.
                     //
                     // This means that we'll potentially overrun our value_count_goal by up to a full data block.
-                    const fully_exhausted = true;
+                    // FIXME: Temp for now
+                    const fully_exhausted = values_in_a_len + values_in_b_len == 0;
+                    move_to_next_compaction = fully_exhausted;
+
+                    std.log.info("Post blip_cpu loop: {} and {}", .{ values_in_a_len, values_in_b_len });
 
                     switch (compaction.check_and_finish_blocks(.{ .index_block = fully_exhausted, .data_block = fully_exhausted })) {
                         // We might still have input values, even if an output block is full etc.
-                        .cpu_finished => continue,
+                        .finished_data_block => continue,
 
-                        .cpu_unfinished => continue,
+                        .unfinished_data_block => continue,
 
                         // If we have to write, we need to break out of the outer loop.
                         .need_write => {
                             // FIXME: Gross - maybe make transitioning between needed pipeline states an explicit fn
                             beat_context.pipeline_context.write.data_blocks_count = beat_context.pipeline_context.cpu.current_output_data_block;
+                            beat_context.pipeline_context.cpu.current_output_data_block = 0; // FIXME: HACK where to we do resetting between etc!!
+                            beat_context.pipeline_context.write.set_next_data_block = !fully_exhausted;
                             break :outer;
                         },
                     }
@@ -890,11 +874,11 @@ pub fn CompactionType(
             // FIXME: Move these to activate and assert?
             beat_context.pipeline_context.cpu.callback = callback;
             beat_context.pipeline_context.cpu.ptr = ptr;
-            callback(ptr, true);
+            callback(ptr, move_to_next_compaction);
         }
 
         // FIXME: Make input_exhausted a struct rather
-        fn check_and_finish_blocks(compaction: *Compaction, force_flush: struct { index_block: bool, data_block: bool }) enum { cpu_unfinished, cpu_finished, need_write } {
+        fn check_and_finish_blocks(compaction: *Compaction, force_flush: struct { index_block: bool, data_block: bool }) enum { unfinished_data_block, finished_data_block, need_write } {
             assert(compaction.bar_context != null);
             assert(compaction.beat_context != null);
 
@@ -965,9 +949,9 @@ pub fn CompactionType(
             }
 
             if (need_write) return .need_write;
-            if (finished_data_block) return .cpu_finished;
+            if (finished_data_block) return .finished_data_block;
 
-            return .cpu_unfinished;
+            return .unfinished_data_block;
         }
 
         /// Perform write IO to write our output_index_blocks and output_data_blocks to disk.
@@ -1020,7 +1004,6 @@ pub fn CompactionType(
             assert(compaction.beat_context != null);
 
             const bar_context = &compaction.bar_context.?;
-            _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
             // FIXME: Assert write is active, and ditto for other stages callbacks.
@@ -1037,6 +1020,12 @@ pub fn CompactionType(
 
                 // FIXME: This style is gross! deactivate_and_assert clears the callback / ptr.
                 beat_context.pipeline_context.deactivate_and_assert(.write);
+
+                // Reset our table data block (NB what about index block.)
+                // Done after deactivate_and_assert because that bumps the split
+                if (beat_context.pipeline_context.write.set_next_data_block)
+                    bar_context.table_builder.set_data_block(beat_context.blocks.output_data_blocks[beat_context.pipeline_context.write.current_split][0]);
+
                 callback(ptr, null);
                 // compaction.write_finish();
             }
@@ -1181,8 +1170,11 @@ pub fn CompactionType(
 
         ////////////// The actual CPU merging methods below. //////////////
         // TODO: Add benchmarks for all of these specifically.
-        fn copy(table_builder: *Table.Builder, values_in: *[2][]const Value, input_level: InputLevel) void {
-            // assert(compaction.state == .compacting);
+        // FIXME: The split between iterator and non-iterator versions is messy :/
+        fn copy(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, input_level: InputLevel) void {
+            assert(values_in_union.* == .values_in);
+            const values_in = &values_in_union.values_in;
+
             assert(values_in[@intFromEnum(input_level) +% 1].len == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1205,7 +1197,10 @@ pub fn CompactionType(
             table_builder.value_count += @as(u32, @intCast(len));
         }
 
-        fn copy_drop_tombstones(table_builder: *Table.Builder, values_in: *[2][]const Value) void {
+        fn copy_drop_tombstones(table_builder: *Table.Builder, values_in_union: *ValuesInUnion) void {
+            assert(values_in_union.* == .values_in);
+            const values_in = &values_in_union.values_in;
+
             assert(values_in[1].len == 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1235,7 +1230,136 @@ pub fn CompactionType(
             table_builder.value_count = values_out_index;
         }
 
-        fn merge(table_builder: *Table.Builder, values_in: *[2][]const Value, drop_tombstones: bool) void {
+        fn merge(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, drop_tombstones: bool) void {
+            assert(values_in_union.* == .values_in);
+            const values_in = &values_in_union.values_in;
+
+            assert(values_in[0].len > 0);
+            assert(values_in[1].len > 0);
+            assert(table_builder.value_count < Table.layout.block_value_count_max);
+
+            // Copy variables locally to ensure a tight loop.
+            const values_in_a = values_in[0];
+            const values_in_b = values_in[1];
+            const values_out = table_builder.data_block_values();
+            var values_in_a_index: usize = 0;
+            var values_in_b_index: usize = 0;
+            var values_out_index = table_builder.value_count;
+
+            // Merge as many values as possible.
+            while (values_in_a_index < values_in_a.len and
+                values_in_b_index < values_in_b.len and
+                values_out_index < values_out.len)
+            {
+                const value_a = &values_in_a[values_in_a_index];
+                const value_b = &values_in_b[values_in_b_index];
+                switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
+                    .lt => {
+                        values_in_a_index += 1;
+                        if (drop_tombstones and
+                            tombstone(value_a))
+                        {
+                            assert(Table.usage != .secondary_index);
+                            continue;
+                        }
+                        values_out[values_out_index] = value_a.*;
+                        values_out_index += 1;
+                    },
+                    .gt => {
+                        values_in_b_index += 1;
+                        values_out[values_out_index] = value_b.*;
+                        values_out_index += 1;
+                    },
+                    .eq => {
+                        values_in_a_index += 1;
+                        values_in_b_index += 1;
+
+                        if (Table.usage == .secondary_index) {
+                            // Secondary index optimization --- cancel out put and remove.
+                            assert(tombstone(value_a) != tombstone(value_b));
+                            continue;
+                        } else if (drop_tombstones) {
+                            if (tombstone(value_a)) {
+                                continue;
+                            }
+                        }
+
+                        values_out[values_out_index] = value_a.*;
+                        values_out_index += 1;
+                    },
+                }
+            }
+
+            // Copy variables back out.
+            values_in[0] = values_in_a[values_in_a_index..];
+            values_in[1] = values_in_b[values_in_b_index..];
+            table_builder.value_count = values_out_index;
+        }
+
+        fn copy_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, input_level: InputLevel) void {
+            assert(false); // FIXME: Not done
+            assert(values_in_union.* == .values_in);
+            const values_in = &values_in_union.values_in;
+
+            assert(values_in[@intFromEnum(input_level) +% 1].len == 0);
+            assert(table_builder.value_count < Table.layout.block_value_count_max);
+
+            const values_in_level = values_in[@intFromEnum(input_level)];
+            const values_out = table_builder.data_block_values();
+            var values_out_index = table_builder.value_count;
+
+            assert(values_in_level.len > 0);
+
+            const len = @min(values_in_level.len, values_out.len - values_out_index);
+            assert(len > 0);
+            stdx.copy_disjoint(
+                .exact,
+                Value,
+                values_out[values_out_index..][0..len],
+                values_in_level[0..len],
+            );
+
+            values_in[@intFromEnum(input_level)] = values_in_level[len..];
+            table_builder.value_count += @as(u32, @intCast(len));
+        }
+
+        fn copy_drop_tombstones_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion) void {
+            assert(values_in_union.* == .values_in_b);
+            const values_in = &values_in_union.values_in_b;
+
+            assert(values_in[1].len == 0);
+            assert(table_builder.value_count < Table.layout.block_value_count_max);
+
+            // Copy variables locally to ensure a tight loop.
+            const values_in_a = values_in[0];
+            const values_out = table_builder.data_block_values();
+            var values_out_index = table_builder.value_count;
+
+            // Merge as many values as possible.
+            while (values_out_index < values_out.len) {
+                const maybe_value_a = values_in_a.next();
+                if (maybe_value_a) |*value_a| {
+                    if (tombstone(value_a)) {
+                        assert(Table.usage != .secondary_index);
+                        continue;
+                    }
+                    values_out[values_out_index] = value_a.*;
+                    values_out_index += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Copy variables back out.
+            values_in[0] = values_in_a;
+            table_builder.value_count = values_out_index;
+        }
+
+        fn merge_iterator(table_builder: *Table.Builder, values_in_union: *ValuesInUnion, drop_tombstones: bool) void {
+            assert(false); // FIXME: Not done
+            assert(values_in_union.* == .values_in);
+            const values_in = &values_in_union.values_in;
+
             assert(values_in[0].len > 0);
             assert(values_in[1].len > 0);
             assert(table_builder.value_count < Table.layout.block_value_count_max);

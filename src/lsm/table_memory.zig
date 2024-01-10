@@ -91,8 +91,6 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                 self.source_index = source_index;
 
-                std.log.info("Yielding: {?}", .{candidate});
-
                 return candidate;
 
                 // // At this point, source_index and target_index are actually counts.
@@ -116,12 +114,12 @@ pub fn TableMemoryType(comptime Table: type) type {
                 // return target_count;
             }
 
-            pub fn count(self: *const Iterator) bool {
+            pub fn count(self: *const Iterator) usize {
                 return self.table_memory.count();
             }
 
-            pub fn remaining(self: *const Iterator) bool {
-                return self.source_index < self.table_memory.count();
+            pub fn remaining(self: *const Iterator) usize {
+                return self.table_memory.count() - self.source_index;
             }
         };
 

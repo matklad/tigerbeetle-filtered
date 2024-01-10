@@ -406,7 +406,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 if (first_beat) {
                     for (self.compactions.slice(), 0..) |*compaction, i| {
                         // FIXME: These blocks need to be disjoint. Any way we can assert that?
-                        compaction.bar_setup_budget(constants.lsm_batch_multiple - 1, self.compaction_blocks[1000 + i .. 1000 + i + 1]);
+                        // constants.lsm_batch_multiple - 1
+                        compaction.bar_setup_budget(1, self.compaction_blocks[1000 + i .. 1000 + i + 1]);
                     }
 
                     // Split up our internal block pool as needed for the compaction pipelines.
@@ -538,6 +539,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                                 }
 
                                 // FIXME: Massive hack, hardcoding to get 2 to run. The blocks need to be released by split too.
+                                std.log.info("... ... ... because we're moving on to next compaction.", .{});
                                 slot.* = .{ .pipeline = pipeline, .interface = pipeline.compactions.slice()[pipeline.compaction_idx] };
                                 pipeline.running_stages += 1;
                                 slot.*.?.interface.beat_blocks_assign(pipeline.compaction_blocks_split, pipeline.compaction_reads, pipeline.compaction_writes);
