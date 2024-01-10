@@ -127,6 +127,9 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = mode,
     });
+    if (mode == .ReleaseSafe) {
+        tigerbeetle.strip = true;
+    }
     if (emit_llvm_ir) {
         _ = tigerbeetle.getEmittedLlvmIr();
     }
@@ -259,19 +262,6 @@ pub fn build(b: *std.Build) !void {
             "Skip tests that do not match filter",
         );
 
-        // This needs to be built separately from src/unit_tests.zig
-        // because repl.zig and repl_test.zig depend on the `vsr`
-        // package. Zig 0.11.0 is no longer ok with importing both `vsr`,
-        // the module, and `vsr.zig` within the same build unit.
-        const repl_tests = b.addTest(.{
-            .root_source_file = .{ .path = "src/tigerbeetle/repl_test.zig" },
-            .target = target,
-            .optimize = mode,
-            .filter = test_filter,
-        });
-        repl_tests.addModule("vsr", vsr_module);
-        repl_tests.addModule("vsr_options", vsr_options_module);
-
         const unit_tests = b.addTest(.{
             .root_source_file = .{ .path = "src/unit_tests.zig" },
             .target = target,
@@ -302,21 +292,29 @@ pub fn build(b: *std.Build) !void {
 
         const unit_tests_exe_step = b.step("test:build", "Build the unit tests");
         const install_unit_tests_exe = b.addInstallArtifact(unit_tests, .{});
-        const install_repl_tests_exe = b.addInstallArtifact(repl_tests, .{});
         unit_tests_exe_step.dependOn(&install_unit_tests_exe.step);
-        unit_tests_exe_step.dependOn(&install_repl_tests_exe.step);
 
-        const unit_tests_step = b.step("test:unit", "Run the unit tests");
         const run_unit_tests = b.addRunArtifact(unit_tests);
-        const run_repl_tests = b.addRunArtifact(repl_tests);
+        const unit_tests_step = b.step("test:unit", "Run the unit tests");
         unit_tests_step.dependOn(&run_unit_tests.step);
-        unit_tests_step.dependOn(&run_repl_tests.step);
+
+        const integration_tests = b.addTest(.{
+            .root_source_file = .{ .path = "src/integration_tests.zig" },
+            .target = target,
+            .optimize = mode,
+        });
+        const run_integration_tests = b.addRunArtifact(integration_tests);
+        // Ensure integration test have tigerbeetle binary.
+        run_integration_tests.step.dependOn(b.getInstallStep());
+        const integration_tests_step = b.step("test:integration", "Run the integration tests");
+        integration_tests_step.dependOn(&run_integration_tests.step);
 
         const test_step = b.step("test", "Run the unit tests");
         test_step.dependOn(&run_unit_tests.step);
-        test_step.dependOn(&run_repl_tests.step);
 
         if (test_filter == null) {
+            test_step.dependOn(&run_integration_tests.step);
+
             // Test that our demos compile, but don't run them.
             inline for (.{
                 "demo_01_create_accounts",
@@ -408,22 +406,6 @@ pub fn build(b: *std.Build) !void {
             mode,
             target,
         );
-        repl_integration(
-            b,
-            mode,
-            target,
-        );
-
-        const ci_exe = b.addExecutable(.{
-            .name = "ci",
-            .root_source_file = .{ .path = "src/scripts/ci.zig" },
-            .target = target,
-            .main_pkg_path = .{ .path = "src" },
-        });
-        const ci_run = b.addRunArtifact(ci_exe);
-        if (b.args) |args| ci_run.addArgs(args);
-        const ci_step = b.step("ci", "Run CI checks");
-        ci_step.dependOn(&ci_run.step);
     }
 
     {
@@ -563,82 +545,27 @@ pub fn build(b: *std.Build) !void {
         step.dependOn(&run_cmd.step);
     }
 
-    inline for (.{
-        .{
-            .name = "fuzz_ewah",
-            .file = "src/ewah_fuzz.zig",
-            .description = "Fuzz EWAH codec. Args: [--seed <seed>]",
-        },
-        .{
-            .name = "fuzz_lsm_cache_map",
-            .file = "src/lsm/cache_map_fuzz.zig",
-            .description = "Fuzz the LSM cache map. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_lsm_forest",
-            .file = "src/lsm/forest_fuzz.zig",
-            .description = "Fuzz the LSM forest. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_lsm_manifest_log",
-            .file = "src/lsm/manifest_log_fuzz.zig",
-            .description = "Fuzz the ManifestLog. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_lsm_manifest_level",
-            .file = "src/lsm/manifest_level_fuzz.zig",
-            .description = "Fuzz the ManifestLevel. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_lsm_tree",
-            .file = "src/lsm/tree_fuzz.zig",
-            .description = "Fuzz the LSM tree. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_lsm_segmented_array",
-            .file = "src/lsm/segmented_array_fuzz.zig",
-            .description = "Fuzz the LSM segmented array. Args: [--seed <seed>]",
-        },
-        .{
-            .name = "fuzz_vsr_journal_format",
-            .file = "src/vsr/journal_format_fuzz.zig",
-            .description = "Fuzz the WAL format. Args: [--seed <seed>]",
-        },
-        .{
-            .name = "fuzz_vsr_superblock",
-            .file = "src/vsr/superblock_fuzz.zig",
-            .description = "Fuzz the SuperBlock. Args: [--seed <seed>] [--events-max <count>]",
-        },
-        .{
-            .name = "fuzz_vsr_free_set",
-            .file = "src/vsr/free_set_fuzz.zig",
-            .description = "Fuzz the FreeSet. Args: [--seed <seed>]",
-        },
-        .{
-            .name = "fuzz_vsr_superblock_quorums",
-            .file = "src/vsr/superblock_quorums_fuzz.zig",
-            .description = "Fuzz the SuperBlock Quorums. Args: [--seed <seed>]",
-        },
-    }) |fuzzer| {
-        const exe = b.addExecutable(.{
-            .name = fuzzer.name,
-            .root_source_file = .{ .path = fuzzer.file },
+    { // Fuzzers: zig build fuzz -- lsm_tree --seed=92 --events-max=100
+        const fuzz_exe = b.addExecutable(.{
+            .name = "fuzz",
+            .root_source_file = .{ .path = "src/fuzz_tests.zig" },
             .target = target,
             .optimize = mode,
             .main_pkg_path = .{ .path = "src" },
         });
-        exe.omit_frame_pointer = false;
-        exe.addOptions("vsr_options", options);
-        link_tracer_backend(exe, git_clone_tracy, tracer_backend, target);
-        const install_step = b.addInstallArtifact(exe, .{});
-        const build_step = b.step("build_" ++ fuzzer.name, fuzzer.description);
-        build_step.dependOn(&install_step.step);
+        fuzz_exe.omit_frame_pointer = false;
+        fuzz_exe.addOptions("vsr_options", options);
+        link_tracer_backend(fuzz_exe, git_clone_tracy, tracer_backend, target);
 
-        const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+        const fuzz_run = b.addRunArtifact(fuzz_exe);
+        if (b.args) |args| fuzz_run.addArgs(args);
 
-        const run_step = b.step(fuzzer.name, fuzzer.description);
-        run_step.dependOn(&run_cmd.step);
+        const fuzz_step = b.step("fuzz", "Run the specified fuzzer");
+        fuzz_step.dependOn(&fuzz_run.step);
+
+        const fuzz_install_step = b.addInstallArtifact(fuzz_exe, .{});
+        const fuzz_build_step = b.step("build_fuzz", "Build fuzzers");
+        fuzz_build_step.dependOn(&fuzz_install_step.step);
     }
 
     inline for (.{
@@ -679,16 +606,18 @@ pub fn build(b: *std.Build) !void {
         step.dependOn(&run_cmd.step);
     }
 
-    const release_exe = b.addExecutable(.{
-        .name = "release",
-        .root_source_file = .{ .path = "src/scripts/release.zig" },
-        .target = target,
-        .main_pkg_path = .{ .path = "src" },
-    });
-    const release_exe_run = b.addRunArtifact(release_exe);
-    if (b.args) |args| release_exe_run.addArgs(args);
-    const release_step = b.step("release", "build and publish release artifacts");
-    release_step.dependOn(&release_exe_run.step);
+    { // Free-form automation: `zig build scripts -- ci --language=java`
+        const scripts_exe = b.addExecutable(.{
+            .name = "scripts",
+            .root_source_file = .{ .path = "src/scripts/main.zig" },
+            .target = target,
+            .main_pkg_path = .{ .path = "src" },
+        });
+        const scripts_run = b.addRunArtifact(scripts_exe);
+        if (b.args) |args| scripts_run.addArgs(args);
+        const scripts_step = b.step("scripts", "Run automation scripts");
+        scripts_step.dependOn(&scripts_run.step);
+    }
 }
 
 fn link_tracer_backend(
@@ -1210,26 +1139,6 @@ fn client_docs(
     client_docs_build.dependOn(&install_step.step);
 
     maybe_execute(b, allocator, client_docs_build, install_step, "client_docs");
-}
-
-fn repl_integration(
-    b: *std.build.Builder,
-    mode: Mode,
-    target: CrossTarget,
-) void {
-    const binary = b.addExecutable(.{
-        .name = "repl_integration",
-        .root_source_file = .{ .path = "src/clients/repl_integration.zig" },
-        .target = target,
-        .optimize = mode,
-        .main_pkg_path = .{ .path = "src" },
-    });
-
-    const repl_integration_build = b.step("repl_integration", "Build cli client integration test script.");
-    repl_integration_build.dependOn(&binary.step);
-
-    const install_step = b.addInstallArtifact(binary, .{});
-    repl_integration_build.dependOn(&install_step.step);
 }
 
 /// Steps which unconditionally fails with a message.

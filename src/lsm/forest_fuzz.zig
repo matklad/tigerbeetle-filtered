@@ -216,6 +216,7 @@ const Environment = struct {
     /// than one block to exercise the block linked list logic from CheckpointTrailer.
     fn fragmentate_free_set(env: *Environment) void {
         assert(env.grid.free_set.count_acquired() == 0);
+        assert(free_set_fragments_max * free_set_fragment_size <= env.grid.free_set.count_free());
 
         var reservations: [free_set_fragments_max]Reservation = undefined;
         for (&reservations) |*reservation| {
@@ -861,11 +862,10 @@ pub fn generate_fuzz_ops(random: std.rand.Random, fuzz_op_count: usize) ![]const
 
 const io_latency_mean = 20;
 
-pub fn main() !void {
+pub fn main(fuzz_args: fuzz.FuzzArgs) !void {
     try tracer.init(allocator);
     defer tracer.deinit(allocator);
 
-    const fuzz_args = try fuzz.parse_fuzz_args(allocator);
     var rng = std.rand.DefaultPrng.init(fuzz_args.seed);
     const random = rng.random();
 

@@ -5,6 +5,7 @@ test {
     _ = @import("fifo.zig");
     _ = @import("flags.zig");
     _ = @import("io.zig");
+    _ = @import("repl.zig");
     _ = @import("ring_buffer.zig");
     _ = @import("shell.zig");
     _ = @import("stdx.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("state_machine/workload.zig");
 
     _ = @import("testing/id.zig");
+    _ = @import("testing/snaptest.zig");
     _ = @import("testing/storage.zig");
     _ = @import("testing/table.zig");
     _ = @import("testing/tmp_tigerbeetle.zig");

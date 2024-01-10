@@ -1237,6 +1237,7 @@ pub fn ReplicaType(
                 .command = .pong,
                 .cluster = self.cluster,
                 .replica = self.replica,
+                .view = self.view_durable(), // Don't drop pongs while the view is being updated.
                 // Copy the ping's monotonic timestamp to our pong and add our wall clock sample:
                 .ping_timestamp_monotonic = message.header.ping_timestamp_monotonic,
                 .pong_timestamp_wall = @as(u64, @bitCast(self.clock.realtime())),
@@ -2543,11 +2544,12 @@ pub fn ReplicaType(
                 .command = .ping,
                 .cluster = self.cluster,
                 .replica = self.replica,
-                .ping_timestamp_monotonic = self.clock.monotonic(),
-                // Checkpoint information:
+                .view = self.view_durable(), // Don't drop pings while the view is being updated.
                 .checkpoint_id = self.superblock.working.checkpoint_id(),
                 .checkpoint_op = self.op_checkpoint(),
+                .ping_timestamp_monotonic = self.clock.monotonic(),
             };
+            assert(ping.view <= self.view);
 
             self.send_header_to_other_replicas_and_standbys(ping.frame_const().*);
         }
@@ -4365,35 +4367,6 @@ pub fn ReplicaType(
                 });
                 return true;
             }
-
-            // TODO(Async checkpoints): Remove this check.
-            // It is a hack to prevent an availability issue, but it comes at a huge
-            // performance cost.
-            // For an explanation, see: "Cluster: repair: primary checkpoint, backup crash before
-            // checkpoint, primary prepare".
-            if (self.op_checkpoint() != 0 and
-                vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).? + 1 == self.op)
-            {
-                var count: usize = 0;
-                for (self.sync_target_quorum.candidates, 0..) |target, replica_index| {
-                    if (replica_index == self.replica) {
-                        count += 1; // Count ourselves.
-                    } else {
-                        count += @intFromBool(
-                            target != null and
-                                target.?.checkpoint_op == self.op_checkpoint(),
-                        );
-                    }
-                }
-
-                if (count < self.quorum_replication) {
-                    log.warn("{}: on_request: ignoring (waiting for backups to checkpoint)", .{
-                        self.replica,
-                    });
-                    return true;
-                }
-            }
-
             return false;
         }
 
@@ -8312,7 +8285,14 @@ pub fn ReplicaType(
                 .prepare, .commit => .normal,
                 // When we are recovering_head we can't participate in a view-change anyway.
                 // But there is a chance that the primary is actually running, despite the DVC/SVC.
-                .do_view_change, .start_view_change => if (self.status == .recovering_head) Status.normal else .view_change,
+                .do_view_change,
+                .start_view_change,
+                // For pings, we don't actually know where the new view is started or not.
+                // Conservatively transition to view change: at worst, we'll send a larger DVC
+                // instead of a RSV.
+                .ping,
+                .pong,
+                => if (self.status == .recovering_head) Status.normal else .view_change,
                 // on_start_view() handles the (possible) transition to view-change manually, before
                 // transitioning to normal.
                 .start_view => return,
