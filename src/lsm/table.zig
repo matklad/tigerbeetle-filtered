@@ -412,7 +412,6 @@ pub fn TableType(
                 tree_id: u16,
             };
 
-            // FIXME: This needs to return its index block!
             pub fn index_block_finish(
                 builder: *Builder,
                 options: IndexFinishOptions,

@@ -102,11 +102,10 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
 
         manifest: Manifest,
 
-        /// The forest can run compactions in any order, potentially concurrently across all levels
-        /// simultaneously. There's a + 1 here for the immmutable table to level 0, but it's
-        /// cancelled by a - 1 since the last level doesn't compact to anything.
-        /// FIXME: We might not want the memory overhead for the context. Let's work out what it is first.
-        ///       As of very early on - ~2kb per compaction, so ~16kb per tree
+        /// The forest can run compactions in any order, potentially even concurrently across all
+        /// levels and trees simultaneously. There's a + 1 here for the immmutable table to level
+        /// 0, but it's cancelled by a - 1 since the last level doesn't compact to anything.
+        /// Each Compaction object is only around ~2KB of control plane state.
         compactions: [constants.lsm_levels]Compaction,
 
         /// While a compaction is running, this is the op of the last compact().
@@ -179,7 +178,6 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
 
             for (&tree.compactions) |*compaction| compaction.deinit();
 
-            // TODO Consider whether we should release blocks acquired from Grid.block_free_set.
             tree.manifest.deinit(allocator);
             tree.table_immutable.deinit(allocator);
             tree.table_mutable.deinit(allocator);

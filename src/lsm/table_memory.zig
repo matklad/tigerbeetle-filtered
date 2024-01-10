@@ -30,20 +30,15 @@ pub fn TableMemoryType(comptime Table: type) type {
                     for (source[0 .. source.len - 1], source[1..source.len]) |*value, *value_next| {
                         assert(key_from_value(value) <= key_from_value(value_next));
                     }
-                }
 
-                if (constants.verify) {
                     // Our output must be strictly increasing.
                     // An output length of 1 is always strictly increasing.
                     const verify_iterator = Iterator{ .table_memory = table_memory };
-                    _ = verify_iterator;
-                    // FIXME: Finish
-                    // for (
-                    //     target[0 .. target_count - 1],
-                    //     target[1..target_count],
-                    // ) |*value, *value_next| {
-                    //     assert(key_from_value(value_next) > key_from_value(value));
-                    // }
+                    var value = verify_iterator.next();
+                    while (verify_iterator.next()) |value_next| {
+                        assert(key_from_value(value_next) > key_from_value(value));
+                        value = value_next;
+                    }
                 }
 
                 return .{
@@ -93,25 +88,12 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                 return candidate;
 
-                // // At this point, source_index and target_index are actually counts.
-                // // source_index will always be incremented after the final iteration as part of the
-                // // continue expression.
-                // // target_index will always be incremented, since either source_index runs out first
-                // // so value_next_equal is false, or a new value is hit, which will increment it.
-                // const source_count = source_index;
-                // const target_count = target_index;
-
-                // std.log.info("Filled using {} vals", .{source_count});
-                // bar_context.table_info_a.immutable =
-                //     bar_context.table_info_a.immutable[source_count..];
-
+                // FIXME: Anyway we can bring these asserts back nicely?
                 // if (target_count == 0) {
                 //     assert(Table.usage == .secondary_index);
                 //     return 0;
                 // }
-
                 // assert(target_count > 0);
-                // return target_count;
             }
 
             pub fn count(self: *const Iterator) usize {

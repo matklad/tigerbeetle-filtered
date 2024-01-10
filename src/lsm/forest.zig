@@ -16,7 +16,7 @@ const allocate_block = @import("../vsr/grid.zig").allocate_block;
 const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_size, 16);
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
 const ScanBufferPool = @import("scan_buffer.zig").ScanBufferPool;
-const CompactionInfo = @import("compaction.zig").CompactionInfo;
+const CompactionInterfaceType = @import("compaction.zig").CompactionInterfaceType;
 const CompactionBlocks = @import("compaction.zig").CompactionBlocks;
 
 const table_count_max = @import("tree.zig").table_count_max;
@@ -148,117 +148,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
     };
 
     const Grid = GridType(_Storage);
-
-    // FIXME: How could we move these into compaction.zig?
-    const CompactionInterface = struct {
-        const Dispatcher = T: {
-            var type_info = @typeInfo(union(enum) {});
-
-            // Union fields for each compaction type.
-            for (_tree_infos) |tree_info| {
-                const Compaction = tree_info.Tree.Compaction;
-                const type_name = @typeName(Compaction);
-
-                for (type_info.Union.fields) |field| {
-                    if (std.mem.eql(u8, field.name, type_name)) {
-                        break;
-                    }
-                } else {
-                    type_info.Union.fields = type_info.Union.fields ++ [_]std.builtin.Type.UnionField{.{
-                        .name = type_name,
-                        .type = *Compaction,
-                        .alignment = @alignOf(*Compaction),
-                    }};
-                }
-            }
-
-            // We need a tagged union for dynamic dispatching.
-            type_info.Union.tag_type = blk: {
-                const union_fields = type_info.Union.fields;
-                var tag_fields: [union_fields.len]std.builtin.Type.EnumField =
-                    undefined;
-                for (&tag_fields, union_fields, 0..) |*tag_field, union_field, i| {
-                    tag_field.* = .{
-                        .name = union_field.name,
-                        .value = i,
-                    };
-                }
-
-                break :blk @Type(.{ .Enum = .{
-                    .tag_type = std.math.IntFittingRange(0, tag_fields.len - 1),
-                    .fields = &tag_fields,
-                    .decls = &.{},
-                    .is_exhaustive = true,
-                } });
-            };
-
-            break :T @Type(type_info);
-        };
-
-        const Self = @This();
-
-        dispatcher: Dispatcher,
-        info: CompactionInfo,
-
-        pub fn init(info: CompactionInfo, compaction: anytype) @This() {
-            const Compaction = @TypeOf(compaction.*);
-            const type_name = @typeName(Compaction);
-
-            return .{
-                .info = info,
-                .dispatcher = @unionInit(Dispatcher, type_name, compaction),
-            };
-        }
-
-        pub fn bar_setup_budget(self: *const Self, beat_budget: u64, output_index_blocks: []BlockPtr) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.bar_setup_budget(beat_budget, output_index_blocks),
-            };
-        }
-
-        pub fn beat_grid_acquire(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_grid_acquire(),
-            };
-        }
-
-        pub fn beat_blocks_assign(self: *Self, blocks: CompactionBlocks, grid_reads: []Grid.FatRead, grid_writes: []Grid.FatWrite) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_blocks_assign(blocks, grid_reads, grid_writes),
-            };
-        }
-
-        // FIXME: Very unhappy with the callback style here!
-        pub fn blip_read(self: *Self, callback: *const fn (*anyopaque, ?bool) void) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_read(callback, self),
-            };
-        }
-
-        pub fn blip_cpu(self: *Self, callback: *const fn (*anyopaque, ?bool) void) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_cpu(callback, self),
-            };
-        }
-
-        pub fn blip_write(self: *Self, callback: *const fn (*anyopaque, ?bool) void) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.blip_write(callback, self),
-            };
-        }
-
-        // pub fn beat_blocks_release(self: *Self) void {
-        //     return switch (self.dispatcher) {
-        //         inline else => |compaction_impl| compaction_impl.beat_blocks_release(),
-        //     };
-        // }
-
-        pub fn beat_grid_forfeit(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.beat_grid_forfeit(),
-            };
-        }
-    };
+    const CompactionInterface = CompactionInterfaceType(Grid, _tree_infos);
 
     return struct {
         const Forest = @This();

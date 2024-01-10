@@ -1139,7 +1139,7 @@ const Pace = struct {
 
         const block_entries_max = schema.ManifestNode.entry_count_max;
 
-        // TODO!!!!!
+        // FIXME!!!!!
         const half_bar_append_entries_max = options.tree_count * 8 * 9 * 3;
         // const half_bar_append_entries_max = options.tree_count *
         //     tree.compactions_max *
