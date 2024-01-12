@@ -720,7 +720,6 @@ pub fn GridType(comptime Storage: type) type {
             const write_header = schema.header_from_block(write.block.*);
             assert(write_header.size > @sizeOf(vsr.Header));
             assert(write_header.size <= constants.block_size);
-
             grid.superblock.storage.write_sectors(
                 write_block_callback,
                 &iop.completion,
