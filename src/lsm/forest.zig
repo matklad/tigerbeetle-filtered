@@ -765,9 +765,23 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             assert(op >= constants.lsm_batch_multiple or forest.compaction_pipeline.compactions.count() == 0);
 
             forest.compaction_pipeline.beat(forest, op, compact_callback);
+
+            // Manifest log compaction.
+            if (op % @divExact(constants.lsm_batch_multiple, 2) == 0) {
+                assert(forest.manifest_log_progress == .idle);
+
+                forest.manifest_log_progress = .compacting;
+                forest.manifest_log.compact(compact_manifest_log_callback, op);
+            } else {
+                if (op == 1) {
+                    assert(forest.manifest_log_progress == .idle);
+                    forest.manifest_log_progress = .skip;
+                } else {
+                    assert(forest.manifest_log_progress != .idle);
+                }
+            }
         }
 
-        // FIXME: This mixes both manifest and non-manifest compaction
         fn compact_callback(forest: *Forest) void {
             assert(forest.progress.? == .compact);
             // assert(forest.manifest_log_progress != .idle);
@@ -834,41 +848,22 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             inline for (std.meta.fields(Grooves)) |field| {
                 @field(forest.grooves, field.name).compact(op);
             }
-
-            // FIXME - manifest log NB!
-            // if (op % @divExact(constants.lsm_batch_multiple, 2) == 0) {
-            //     assert(forest.manifest_log_progress == .idle);
-
-            //     forest.manifest_log_progress = .compacting;
-            //     // FIXME - manifest log reservation needs to be brought in with the above somehow
-            //     // forest.manifest_log.compact(compact_manifest_log_callback, op);
-            // } else {
-            //     if (op == 1) {
-            //         assert(forest.manifest_log_progress == .idle);
-            //         forest.manifest_log_progress = .skip;
-            //     } else {
-            //         assert(forest.manifest_log_progress != .idle);
-            //         // FIXME manifest hack
-            //         forest.manifest_log_progress = .skip;
-            //     }
-            // }
         }
 
-        // FIXME manifest log NB!
-        // fn compact_manifest_log_callback(manifest_log: *ManifestLog) void {
-        //     const forest = @fieldParentPtr(Forest, "manifest_log", manifest_log);
-        //     assert(forest.manifest_log_progress == .compacting);
+        fn compact_manifest_log_callback(manifest_log: *ManifestLog) void {
+            const forest = @fieldParentPtr(Forest, "manifest_log", manifest_log);
+            assert(forest.manifest_log_progress == .compacting);
 
-        //     forest.manifest_log_progress = .done;
+            forest.manifest_log_progress = .done;
 
-        //     if (forest.progress) |progress| {
-        //         assert(progress == .compact);
+            if (forest.progress) |progress| {
+                assert(progress == .compact);
 
-        //         forest.compact_callback();
-        //     } else {
-        //         // The manifest log compaction completed between compaction beats.
-        //     }
-        // }
+                forest.compact_callback();
+            } else {
+                // The manifest log compaction completed between compaction beats.
+            }
+        }
 
         fn GrooveFor(comptime groove_field_name: []const u8) type {
             const groove_field = @field(std.meta.FieldEnum(Grooves), groove_field_name);

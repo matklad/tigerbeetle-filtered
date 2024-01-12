@@ -809,11 +809,23 @@ pub fn CompactionType(
             _ = bar_context;
             const beat_context = &compaction.beat_context.?;
 
+            // assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
+
+            // const index_schema_a = schema.TableIndex.from(compaction.index_block_a);
+            // compaction.iterator_a.start(.{
+            //     .grid = compaction.grid,
+            //     .addresses = index_schema_a.data_addresses_used(compaction.index_block_a),
+            //     .checksums = index_schema_a.data_checksums_used(compaction.index_block_a),
+            //     .direction = .ascending,
+            // });
+            // compaction.release_table_blocks(compaction.index_block_a);
+
             // FIXME: Figure out where our read target should go. We can do this by looking at the address and comparing to table_info_a / range_b.
 
             beat_context.pending_index_reads -= 1;
 
             // FIXME: Not sure if I like this too much. According to release_table_blocks, it'll only release at the end of the bar, so should be ok?
+            // FIXME: It's critical to release blocks, so ensure this is done properly.
             compaction.release_table_blocks(block);
 
             if (beat_context.pending_index_reads != 0) return;
@@ -870,6 +882,24 @@ pub fn CompactionType(
             // FIXME: TODO handle when we have b tables lol
             // const values_b = Table.data_block_values_used(blocks_b[cpu.current_block_b])[cpu.current_block_b_idx..];
             const values_b = &.{};
+
+            // // Assert that we're reading data blocks in key order.
+            // const values_in = compaction.values_in[index];
+            // assert(values_in.len > 0);
+            // if (constants.verify) {
+            //     for (values_in[0 .. values_in.len - 1], values_in[1..]) |*value, *value_next| {
+            //         assert(key_from_value(value) < key_from_value(value_next));
+            //     }
+            // }
+            // const first_key = key_from_value(&values_in[0]);
+            // const last_key = key_from_value(&values_in[values_in.len - 1]);
+            // if (compaction.last_keys_in[index]) |last_key_prev| {
+            //     assert(last_key_prev < first_key);
+            // }
+            // if (values_in.len > 1) {
+            //     assert(first_key < last_key);
+            // }
+            // compaction.last_keys_in[index] = last_key;
 
             // FIXME: Assert we're not exhausted.
             switch (compaction.bar_context.?.table_info_a) {
@@ -1009,6 +1039,10 @@ pub fn CompactionType(
                     }
                 }
             }
+
+            // FIXME: Check at least one output value.
+            // assert(filled <= target.len);
+            // if (filled == 0) assert(Table.usage == .secondary_index);
 
             beat_context.pipeline_context.deactivate_and_assert(.cpu);
 
